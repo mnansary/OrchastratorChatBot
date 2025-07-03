@@ -19,7 +19,7 @@ def create_vector_store_from_csv(
     metadata_columns: list,
     vector_db_path: str,
     embedding_func: JinaV3ApiEmbeddings,
-    batch_size: int = 2  # Adjust batch size based on your GPU memory if needed
+    batch_size: int = 1  # Adjust batch size based on your GPU memory if needed
 ) -> None:
     try:
         df = pd.read_csv(csv_path)
@@ -78,7 +78,7 @@ if __name__ == "__main__":
 
     # Make sure these column names match your CSV file
     text_col = 'text' 
-    metadata_cols = ['url',"topic"] 
+    metadata_cols = ["topic"] 
     
     create_vector_store_from_csv(
         csv_path=CSV_FILE_PATH,

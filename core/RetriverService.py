@@ -5,14 +5,13 @@ from tqdm import tqdm
 import warnings
 
 # Import your JinaV3Embeddings class from its file
-from .embedding import JinaV3Embeddings
-
+from embedding import JinaV3ApiEmbeddings
+from config import EMBEDDING_PORT,EMBEDDING_HOST
 warnings.filterwarnings("ignore")
 
 class RetrieverService:
     def __init__(self, 
                  vector_db_path: str,
-                 embedding_model_name: str = "jinaai/jina-embeddings-v3",
                  num_passages_to_retrieve: int = 3):
         """
         Initializes a simple, direct retriever service.
@@ -23,7 +22,7 @@ class RetrieverService:
             num_passages_to_retrieve (int): The number of relevant passages to retrieve.
         """
         print("Initializing RetrieverService...")
-        self.embedding_model = JinaV3Embeddings(embedding_model_name)
+        self.embedding_model = JinaV3ApiEmbeddings(EMBEDDING_HOST,EMBEDDING_PORT)
         
         self.vectorstore = Chroma(
             persist_directory=vector_db_path,
@@ -87,11 +86,11 @@ if __name__ == "__main__":
     # 1. Initialize the service
     retriever_service = RetrieverService(
         vector_db_path=VECTOR_STORE_PATH,
-        num_passages_to_retrieve=3 
+        num_passages_to_retrieve=1 
     )
     
     # 2. Use the service to retrieve documents for a query
-    user_query = "পদ্মা নদীর দৈর্ঘ্য কত?" # "What is the length of the Padma Bridge?"
+    user_query = "রিফান্ড কিভাবে করবো?" # "What is the length of the Padma Bridge?"
     results = retriever_service.retrieve(user_query)
     
     # 3. Print the results

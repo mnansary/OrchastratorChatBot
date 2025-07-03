@@ -78,7 +78,7 @@ def predict(message: str, history: list):
 # This section is unchanged to preserve the look you like.
 demo = gr.ChatInterface(
     fn=predict,  # The function that powers the bot
-    title="Bengal Meat 🥩 - Agent",
+    title="Bengal Meat 🥩 - AI Agent",
     description="Ask me about our products, and I'll help you find the perfect meat for your next meal!",
     examples=[
         ["What kind of beef do you have?"],

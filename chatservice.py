@@ -12,7 +12,7 @@ from core.prompts import ANALYST_PROMPT, STRATEGIST_PROMPTS
 from core.config import VECTOR_DB_PATH, MODEL_URL
 
 class ProactiveChatService:
-    def __init__(self, history_length: int = 10):
+    def __init__(self, history_length: int = 100):
         # NOTE: num_passages_to_retrieve is removed from here.
         print("Initializing ProactiveChatService...")
         self.retriever = RetrieverService(vector_db_path=VECTOR_DB_PATH) # Simplified init

@@ -2,7 +2,6 @@ import requests
 import json
 import math
 from typing import List
-
 # TASK_MAPPING remains the same (zero-indexed)
 TASK_MAPPING = {
     'retrieval.query': 0,

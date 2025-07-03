@@ -3,7 +3,7 @@ VECTOR_DB_PATH="prototype"
 
 
 # The LLM model to be used for RAG
-MODEL_NAME="llama3.1:8b"       
+MODEL_URL="http://localhost:24434"    
 
-# The model to use in sentence-transformers for creation embedding
-EMBEDDING_MODEL="jinaai/jina-embeddings-v3"
+EMBEDDING_HOST= "192.168.20.111"
+EMBEDDING_PORT=24434

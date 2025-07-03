@@ -1,7 +1,6 @@
 import requests
 import json
 from typing import Generator, Dict, Any
-
 class LLMService:
     """
     A simple, synchronous client for a custom LLM web service.

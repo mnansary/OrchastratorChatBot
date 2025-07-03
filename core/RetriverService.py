@@ -5,14 +5,14 @@ from tqdm import tqdm
 import warnings
 
 # Import your JinaV3Embeddings class from its file
-from embedding import JinaV3ApiEmbeddings
-from config import EMBEDDING_PORT,EMBEDDING_HOST
+from .embedding import JinaV3ApiEmbeddings
+from .config import EMBEDDING_PORT,EMBEDDING_HOST
 warnings.filterwarnings("ignore")
 
 class RetrieverService:
     def __init__(self, 
                  vector_db_path: str,
-                 num_passages_to_retrieve: int = 3):
+                 num_passages_to_retrieve: int = 1):
         """
         Initializes a simple, direct retriever service.
 

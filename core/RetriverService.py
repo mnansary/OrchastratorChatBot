@@ -1,65 +1,59 @@
 # your_main_retriever_file.py
 
 from langchain_community.vectorstores import Chroma
-from tqdm import tqdm
 import warnings
+from typing import Dict, Any, List
 
 # Import your JinaV3Embeddings class from its file
 from .embedding import JinaV3ApiEmbeddings
-from .config import EMBEDDING_PORT,EMBEDDING_HOST
+from .config import EMBEDDING_PORT, EMBEDDING_HOST
 warnings.filterwarnings("ignore")
 
 class RetrieverService:
-    def __init__(self, 
-                 vector_db_path: str,
-                 num_passages_to_retrieve: int = 1):
+    def __init__(self, vector_db_path: str):
         """
-        Initializes a simple, direct retriever service.
-
-        Args:
-            vector_db_path (str): Path to the Chroma vector store.
-            embedding_model_name (str): The name of the embedding model to use.
-            num_passages_to_retrieve (int): The number of relevant passages to retrieve.
+        Initializes a more powerful, flexible retriever service.
         """
-        print("Initializing RetrieverService...")
-        self.embedding_model = JinaV3ApiEmbeddings(EMBEDDING_HOST,EMBEDDING_PORT)
+        print("Initializing Advanced RetrieverService...")
+        self.embedding_model = JinaV3ApiEmbeddings(EMBEDDING_HOST, EMBEDDING_PORT)
         
         self.vectorstore = Chroma(
             persist_directory=vector_db_path,
             embedding_function=self.embedding_model
         )
         
-        # We will use the number of passages directly in the search method
-        self.num_passages_to_retrieve = num_passages_to_retrieve
-        
         try:
             db_count = self.vectorstore._collection.count()
-            print(f"✅ RetrieverService initialized successfully. Vector store at '{vector_db_path}' contains {db_count} documents.")
+            print(f"✅ Advanced RetrieverService initialized successfully. Vector store at '{vector_db_path}' contains {db_count} documents.")
         except Exception as e:
-            print(f"⚠️ Warning: Could not get count from vector store. It might be empty or improperly loaded: {e}")
+            print(f"⚠️ Warning: Could not get count from vector store: {e}")
 
-    def retrieve(self, query: str) -> dict:
+    def retrieve(self, query: str, k: int = 3, filters: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Retrieves relevant passages directly from the vector store based on the query.
+        Retrieves relevant passages with dynamic k and metadata filtering.
 
         Args:
             query (str): The user's question.
+            k (int): The number of documents to retrieve for this specific query.
+            filters (dict, optional): A dictionary for metadata filtering. 
+                                      Example: {"category": "Beef items and products"}
 
         Returns:
-            dict: A dictionary containing the original query and a list of retrieved passages.
+            dict: A dictionary containing the query and a list of retrieved passages.
         """
-        print(f"\nPerforming direct retrieval for query: \"{query}\"")
+        print(f"\nPerforming advanced retrieval for query: \"{query}\" with k={k} and filters={filters}")
         
-        # Use similarity_search_with_score to get documents and their relevance scores
+        # Use similarity_search_with_score with dynamic k and the 'filter' argument
+        # THIS IS THE CORRECTED LINE:
         docs_with_scores = self.vectorstore.similarity_search_with_score(
-            query, 
-            k=self.num_passages_to_retrieve
+            query,
+            k=k,
+            filter=filters  # The correct keyword for the LangChain wrapper is 'filter'
         )
 
-        # Format the results
         retrieved_passages = []
         if not docs_with_scores:
-            print("No relevant documents found.")
+            print("No relevant documents found with the given criteria.")
         else:
             for doc, score in docs_with_scores:
                 retrieved_passages.append({
@@ -70,7 +64,6 @@ class RetrieverService:
                 })
             print(f"Found {len(retrieved_passages)} relevant passages.")
             
-        # Sort final passages by score (lower is better for distance metrics like L2)
         retrieved_passages.sort(key=lambda x: x["score"])
 
         return {
@@ -78,22 +71,45 @@ class RetrieverService:
             "retrieved_passages": retrieved_passages
         }
 
-# --- Example Usage ---
+# --- Example Usage (Unchanged) ---
 if __name__ == "__main__":
-    # Path to the vector store you created with create_vectorstore.py
+    import json
+
+    # Path to the vector store you created
     VECTOR_STORE_PATH = "prototype" 
     
     # 1. Initialize the service
     retriever_service = RetrieverService(
         vector_db_path=VECTOR_STORE_PATH,
-        num_passages_to_retrieve=1 
     )
     
-    # 2. Use the service to retrieve documents for a query
-    user_query = "রিফান্ড কিভাবে করবো?" # "What is the length of the Padma Bridge?"
-    results = retriever_service.retrieve(user_query)
-    
-    # 3. Print the results
-    import json
-    print("\n--- Retrieval Results ---")
-    print(json.dumps(results, indent=2, ensure_ascii=False))
+    # --- Example 1: A simple search using default k=3 ---
+    print("\n\n--- Example 1: Simple Search (default k=3) ---")
+    results_1 = retriever_service.retrieve(query="What is your refund policy?")
+    print(json.dumps(results_1, indent=2, ensure_ascii=False))
+
+    # --- Example 2: A search with a custom k value ---
+    print("\n\n--- Example 2: Custom 'k' Search (k=5) ---")
+    results_2 = retriever_service.retrieve(
+        query="all beef products", 
+        k=5
+    )
+    print(json.dumps(results_2, indent=2, ensure_ascii=False))
+
+    # --- Example 3: A search using a metadata filter ---
+    print("\n\n--- Example 3: Metadata Filter Search ---")
+    results_3 = retriever_service.retrieve(
+        query="sausages", 
+        k=3,
+        filters={"topic": "Sausages items and products"}
+    )
+    print(json.dumps(results_3, indent=2, ensure_ascii=False))
+
+    # --- Example 4: A combined search with both filter and custom k ---
+    print("\n\n--- Example 4: Combined Filter and Custom 'k' Search ---")
+    results_4 = retriever_service.retrieve(
+        query="chicken snacks",
+        k=2,
+        filters={"topic": "Snacks items and products"}
+    )
+    print(json.dumps(results_4, indent=2, ensure_ascii=False))

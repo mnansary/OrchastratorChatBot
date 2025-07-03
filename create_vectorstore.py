@@ -7,11 +7,6 @@ from core.embedding import JinaV3ApiEmbeddings
 
 warnings.filterwarnings("ignore")
 
-
-# IMPORTANT: Use the correct path to your CSV file
-CSV_FILE_PATH = "extra/combined_page.csv" 
-VECTOR_DB_PATH = "prototype"
-
 # --- Core Function to Create the Vector Store (with Batching and Final Count) ---
 def create_vector_store_from_csv(
     csv_path: str,
@@ -74,6 +69,10 @@ def create_vector_store_from_csv(
 
 # --- Main Execution Block (No changes here) ---
 if __name__ == "__main__":
+    # IMPORTANT: Use the correct path to your CSV file
+    CSV_FILE_PATH = "extra/final_and_complete.csv" 
+    VECTOR_DB_PATH = "prototype"
+
     embedding_function = JinaV3ApiEmbeddings()
 
     # Make sure these column names match your CSV file

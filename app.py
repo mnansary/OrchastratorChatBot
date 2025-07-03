@@ -1,12 +1,17 @@
 import gradio as gr
-from chat import ProactiveChatService
+# The file `chatservice.py` needs to be in the same directory as `app.py`
+from chatservice import ProactiveChatService 
 
 # --- 1. Initialize the Chat Service ---
 # This is a critical step. We create ONE instance of the service that will be shared
 # across all user sessions in this Gradio app. This is how the conversation history
 # is maintained, as the `chat_service` object itself persists.
 print("Initializing Chat Service for Gradio App...")
-chat_service = ProactiveChatService(num_passages_to_retrieve=3, history_length=8)
+
+# --- THIS IS THE CORRECTED LINE ---
+# The `num_passages_to_retrieve` argument is removed because our new, smarter
+# Analyst stage decides this dynamically for each query.
+chat_service = ProactiveChatService(history_length=8)
 print("Chat Service ready.")
 
 
@@ -47,11 +52,13 @@ def predict(message: str, history: list):
                 # "Thinking..." message with the first chunk, and then append to it.
                 yield "".join(full_answer_list)
             
+            # --- THIS BLOCK IS NOW UNCOMMENTED TO HANDLE SOURCES ---
             elif event["type"] == "final_data":
                 # Once the main stream is done, we get the final metadata.
                 sources = event["content"].get("sources", [])
                 if sources:
                     # Append the formatted sources to the end of the message.
+                    # This adds functionality without changing the look of the chat bubbles.
                     source_str = "\n\n---\n*Sources:* " + ", ".join(sources)
                     full_answer_list.append(source_str)
                     # Yield the final, complete message including sources.
@@ -68,9 +75,10 @@ def predict(message: str, history: list):
 
 
 # --- 3. Configure and Launch the Gradio UI ---
+# This section is unchanged to preserve the look you like.
 demo = gr.ChatInterface(
     fn=predict,  # The function that powers the bot
-    title="Bengal Meat 🥩 - Proactive Sales Agent",
+    title="Bengal Meat 🥩 - Agent",
     description="Ask me about our products, and I'll help you find the perfect meat for your next meal!",
     examples=[
         ["What kind of beef do you have?"],

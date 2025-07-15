@@ -108,39 +108,39 @@ class JinaV3ApiEmbeddings:
             raise ValueError("API returned no embedding for the query.")
         return embeddings[0]
 
-# # --- Test code demonstrating the new batching functionality ---
-# if __name__ == "__main__":
-#     try:
-#         # Initialize with the default batch_size=4
-#         embedder = JinaV3ApiEmbeddings(host="192.168.20.111", port=24434)
-#         print("-" * 50)
+# --- Test code demonstrating the new batching functionality ---
+if __name__ == "__main__":
+    try:
+        # Initialize with the default batch_size=4
+        embedder = JinaV3ApiEmbeddings(host="192.168.20.111", port=24434)
+        print("-" * 50)
 
-#         # Create a list of 7 documents to force batching (4 + 3)
-#         documents_for_batch_test = [
-#             "The sun is the star at the center of the Solar System.", # Batch 1
-#             "Jupiter is the fifth planet from the Sun and the largest in the Solar System.", # Batch 1
-#             "The Moon is Earth's only natural satellite.", # Batch 1
-#             "Mars is the fourth planet from the Sun and the second-smallest planet.", # Batch 1
-#             "The Great Wall of China is a series of fortifications.", # Batch 2
-#             "The Amazon River is the largest river by discharge volume of water.", # Batch 2
-#             "An atom is the smallest unit of ordinary matter." # Batch 2
-#         ]
+        # Create a list of 7 documents to force batching (4 + 3)
+        documents_for_batch_test = [
+            "The sun is the star at the center of the Solar System.", # Batch 1
+            "Jupiter is the fifth planet from the Sun and the largest in the Solar System.", # Batch 1
+            "The Moon is Earth's only natural satellite.", # Batch 1
+            "Mars is the fourth planet from the Sun and the second-smallest planet.", # Batch 1
+            "The Great Wall of China is a series of fortifications.", # Batch 2
+            "The Amazon River is the largest river by discharge volume of water.", # Batch 2
+            "An atom is the smallest unit of ordinary matter." # Batch 2
+        ]
         
-#         print(f"### Testing batching with {len(documents_for_batch_test)} documents and a batch size of {embedder.batch_size} ###")
+        print(f"### Testing batching with {len(documents_for_batch_test)} documents and a batch size of {embedder.batch_size} ###")
         
-#         # Use the embed_documents method, which will trigger the batching logic inside embed()
-#         document_embeddings = embedder.embed_documents(documents_for_batch_test)
+        # Use the embed_documents method, which will trigger the batching logic inside embed()
+        document_embeddings = embedder.embed_documents(documents_for_batch_test)
         
-#         print("\n--- Batching Test Results ---")
-#         print(f"Total documents sent: {len(documents_for_batch_test)}")
-#         print(f"Total embeddings received: {len(document_embeddings)}")
+        print("\n--- Batching Test Results ---")
+        print(f"Total documents sent: {len(documents_for_batch_test)}")
+        print(f"Total embeddings received: {len(document_embeddings)}")
 
-#         # Crucial check: a successful batching operation must return one embedding for each input text
-#         assert len(documents_for_batch_test) == len(document_embeddings)
-#         print("✅ Assertion Passed: The number of embeddings received matches the number of documents sent.")
+        # Crucial check: a successful batching operation must return one embedding for each input text
+        assert len(documents_for_batch_test) == len(document_embeddings)
+        print("✅ Assertion Passed: The number of embeddings received matches the number of documents sent.")
 
-#         if document_embeddings:
-#             print(f"Dimension of embeddings: {len(document_embeddings[0])}")
+        if document_embeddings:
+            print(f"Dimension of embeddings: {len(document_embeddings[0])}")
 
-#     except Exception as e:
-#         print(f"\nAn unexpected error occurred during the batching test: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during the batching test: {e}")

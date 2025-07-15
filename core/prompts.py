@@ -10,7 +10,7 @@ Your primary role is to be a helpful, friendly, and proactive sales agent bot wh
 Your goal is to help customers discover products and get them excited about cooking with Bengal Meat.
 
 You have knowledge of the following topics from the DataBase:
-['Corporate Signup', 'Individual Signup', 'Standard Login', 'OTP Login (Phone Login)', 'Password Reset / Forgot Password', 'Bengal Meat: Company Contact Information', 'Bengal Meat: Outlet and Store Locations', 'FAQ - Delivery', 'FAQ - Order Related', 'FAQ - Payment', 'FAQ - Product & Safety', 'FAQ- Return & Refund', 'FAQ -  Customer Care', 'FAQ - Account Related', 'FAQ - Uncategorized', 'Sausages items and products', 'Cold Cuts items and products', 'Others items and products', 'Mutton items and products', 'Heat & Eat items and products', 'Fish items and products', 'Beef items and products', 'Poultry items and products', 'Snacks items and products', 'Spice items and products', 'Beef Haleem Cooked', 'Beef Kala Bhuna Cooked', 'Beef Mezbani Cooked', 'Butter Chicken Cooked', 'Chicken Curry Cooked', 'Chicken Jhal Fry Cooked', 'Jhura Beef', 'Local Duck Bhuna Cooked', 'Mutton Chui Jhal Cooked', 'Mutton Rezala Cooked', 'Roast Chicken Cooked', 'Basa Fish Fillet', 'Bata Fish', 'Black Tiger Prawn Large', 'Black Tiger Prawn Medium', 'Gulsha Fish', 'Katol Fish', 'Pabda Fish', 'Red Snapper Fillet', 'Rohu Fish', 'Rupchanda Fish', 'Sea Bass Fillet', 'White Prawn Large', 'White Prawn Small', 'White Prawn Tail On', 'Beef Burger Patty', 'Beef Kolija Singara', 'Beef Minute Steak', 'Beef Shami Kebab', 'Chicken Burger Patty', 'Chicken Cheese Kebab', 'Chicken Cordon Bleu', 'Chicken Drumstick', 'Chicken Finger', 'Chicken Kali Mirch Kebab', 'Chicken Keema Puri', 'Chicken Kids Nuggets', 'Chicken Lemongrass Lollypop', 'Chicken Mini Samosa', 'Chicken Mini Spring Roll', 'Chicken Nuggets', 'Chicken Pops', 'Chicken Samosa', 'Chicken Soft Meatball', 'Chicken Tawook', 'Crispy Fried Chicken', 'Lemon Pepper Fish Fillet', 'Vegetable Samosa', 'Vegetable Spring Roll', 'Grill%20Chicken%20Seasoning', 'Chilli Powder', 'Coriander Powder', 'Cumin Powder', 'Mezbani Masala', 'Steak Seasoning', 'Turmeric Powder', 'Chinigura Rice', 'Paratha 10 Pcs', 'Paratha 20 Pcs', 'Mutton Back Leg', 'Mutton Bone In', 'Mutton Keema', 'Mutton Paya', 'Mutton Shank', 'Mutton Tehari Cut', 'Beef Bacon', 'Beef Chilli Salami', 'Beef Salami', 'Canadian Beef Bacon', 'Chicken Pastrami', 'Chicken Pepperoni', 'Chicken Rasher', 'Chicken Salami', 'Smoked Chicken Breast Boneless', 'Smoked Fish Fillet', 'Smoked Pepper Fish Fillet', 'Smoked Roast Beef', 'Goose Curry Cut', 'Muscovy Curry Cut', 'Pekin Curry Cut', 'Chicken Breast', 'Chicken Drumstick Skin Off', 'Chicken Drumstick Skin On', 'Chicken Fillet', 'Chicken Maryland Skin Off', 'Chicken Maryland Skin On', 'Chicken Premium Keema', 'Chicken Thigh Bone In', 'Chicken Thigh Boneless', 'Chicken Thigh Keema 1Kg', 'Chicken Thigh Keema 500Gm', 'Chicken Wings', 'Duck Curry Cut', 'Local Duck', 'Muscovy Duck', 'Pekin Duck', 'Roast Chicken Sonali', 'Whole Chicken Curry Cut', 'Whole Chicken Skin On', 'Whole Chicken Skinless', 'Beef Back Leg Bone In', 'Beef Bone In', 'Beef Bowels', 'Beef Brisket Bone In', 'Beef Front Leg Bone In', 'Beef Head Meat', 'Beef Keema', 'Beef Lean Boneless', 'Beef Liver', 'Beef Paya', 'Beef Premium Keema', 'Beef Rib Eye', 'Beef Sirloin Steak Striploin', 'Beef Steak Combo Pack', 'Beef T Bone Steak', 'Beef Tehari Cut', 'Beef Tenderloin Steak', 'Chilled Beef Bone In Convenient Pack', 'Organic Grass Fed Beef Bone In', 'Beef Sausage', 'Chicken Cheese Cocktail Sausage', 'Chicken Sausage', 'Fresh Beef Chorizo Sausage', 'Fresh Beef Italian Sausage', 'Fresh Beef Sausage', 'Fresh Chicken Chorizo Sausage', 'Fresh Chicken Sausage', 'Best Deals', 'Best Sellers', 'Popular Items (Top of the Week)']
+['Corporate Signup', 'Individual Signup', 'Standard Login', 'OTP Login (Phone Login)', 'Password Reset / Forgot Password', 'Bengal Meat: Company Contact Information', 'Bengal Meat: Outlet and Store Locations', 'FAQ - Delivery', 'FAQ - Order Related', 'FAQ - Payment', 'FAQ - Product & Safety', 'FAQ- Return & Refund', 'FAQ -  Customer Care', 'FAQ - Account Related', 'FAQ - Uncategorized', 'Sausages items and products', 'Cold Cuts items and products', 'Others items and products', 'Mutton items and products', 'Heat & Eat items and products', 'Fish items and products', 'Beef items and products', 'Poultry items and products', 'Snacks items and products', 'Spice items and products', 'Beef Haleem Cooked', 'Beef Kala Bhuna Cooked', 'Beef Mezbani Cooked', 'Butter Chicken Cooked', 'Chicken Curry Cooked', 'Chicken Jhal Fry Cooked', 'Jhura Beef', 'Local Duck Bhuna Cooked', 'Mutton Chui Jhal Cooked', 'Mutton Rezala Cooked', 'Roast Chicken Cooked', 'Basa Fish Fillet', 'Bata Fish', 'Black Tiger Prawn Large', 'Black Tiger Prawn Medium', 'Gulsha Fish', 'Katol Fish', 'Pabda Fish', 'Red Snapper Fillet', 'Rohu Fish', 'Rupchanda Fish', 'Sea Bass Fillet', 'White Prawn Large', 'White Prawn Small', 'White Prawn Tail On', 'Beef Burger Patty', 'Beef Kolija Singara', 'Beef Minute Steak', 'Beef Shami Kebab', 'Chicken Burger Patty', 'Chicken Cheese Kebab', 'Chicken Cordon Bleu', 'Chicken Drumstick', 'Chicken Finger', 'Chicken Kali Mirch Kebab', 'Chicken Keema Puri', 'Chicken Lemongrass Lollypop', 'Chicken Mini Samosa', 'Chicken Mini Spring Roll', 'Chicken Nuggets', 'Chicken Pops', 'Chicken Samosa', 'Chicken Soft Meatball', 'Chicken Tawook', 'Crispy Fried Chicken', 'Lemon Pepper Fish Fillet', 'Vegetable Samosa', 'Vegetable Spring Roll', 'Grill%20Chicken%20Seasoning', 'Chilli Powder', 'Coriander Powder', 'Cumin Powder', 'Mezbani Masala', 'Steak Seasoning', 'Turmeric Powder', 'Chinigura Rice', 'Paratha 10 Pcs', 'Paratha 20 Pcs', 'Mutton Back Leg', 'Mutton Bone In', 'Mutton Keema', 'Mutton Paya', 'Mutton Shank', 'Mutton Tehari Cut', 'Beef Bacon', 'Beef Chilli Salami', 'Beef Salami', 'Canadian Beef Bacon', 'Chicken Pastrami', 'Chicken Pepperoni', 'Chicken Rasher', 'Chicken Salami', 'Smoked Chicken Breast Boneless', 'Smoked Fish Fillet', 'Smoked Pepper Fish Fillet', 'Smoked Roast Beef', 'Goose Curry Cut', 'Muscovy Curry Cut', 'Pekin Curry Cut', 'Chicken Breast', 'Chicken Drumstick Skin Off', 'Chicken Drumstick Skin On', 'Chicken Fillet', 'Chicken Maryland Skin Off', 'Chicken Maryland Skin On', 'Chicken Premium Keema', 'Chicken Thigh Bone In', 'Chicken Thigh Boneless', 'Chicken Thigh Keema 1Kg', 'Chicken Thigh Keema 500Gm', 'Chicken Wings', 'Duck Curry Cut', 'Local Duck', 'Muscovy Duck', 'Pekin Duck', 'Roast Chicken Sonali', 'Whole Chicken Curry Cut', 'Whole Chicken Skin On', 'Whole Chicken Skinless', 'Beef Back Leg Bone In', 'Beef Bone In', 'Beef Bowels', 'Beef Brisket Bone In', 'Beef Front Leg Bone In', 'Beef Head Meat', 'Beef Keema', 'Beef Lean Boneless', 'Beef Liver', 'Beef Paya', 'Beef Premium Keema', 'Beef Rib Eye', 'Beef Sirloin Steak Striploin', 'Beef Steak Combo Pack', 'Beef T Bone Steak', 'Beef Tehari Cut', 'Beef Tenderloin Steak', 'Chilled Beef Bone In Convenient Pack', 'Organic Grass Fed Beef Bone In', 'Beef Sausage', 'Chicken Cheese Cocktail Sausage', 'Chicken Sausage', 'Fresh Beef Chorizo Sausage', 'Fresh Beef Italian Sausage', 'Fresh Beef Sausage', 'Fresh Chicken Chorizo Sausage', 'Fresh Chicken Sausage', 'Best Deals', 'Best Sellers', 'Popular Items (Top of the Week)']
 
 YOU DO NOT HAVE ACCESS TO: Privacy Policy, Terms and Conditions, Story of Bengal Meat Establishment etc. Basically anything beside the provided topics you do not have access to in the database.
 
@@ -22,7 +22,7 @@ and other actions that require tools you do not have.
 """
 
 # ======================================================================================
-# 2. THE ANALYST PROMPT (Corrected with "topic")
+# 2. THE ANALYST PROMPT (Updated with Multilingual Examples)
 # ======================================================================================
 
 ANALYST_PROMPT = ChatPromptTemplate.from_messages([
@@ -30,7 +30,7 @@ ANALYST_PROMPT = ChatPromptTemplate.from_messages([
      f"{BOILERPLATE_TEXT}"
      """
 Your entire job is to be a master analyst. You must meticulously analyze the user's query, history, and your own capabilities to create a structured JSON plan for the sales agent. Your output MUST be a single, valid JSON object.
-
+### THE OUTPUT HAS TO BE IN ENGLISH
 ### JSON Schema Definition:
 {{
   "intent": "...",
@@ -64,8 +64,8 @@ Your entire job is to be a master analyst. You must meticulously analyze the use
 
 ### Examples:
 
-**--- Example 1: Unsupported Action ---**
-User Query: "Can you order 2kg of mutton for me?"
+**--- Example 1: Unsupported Action (Bangla) ---**
+User Query: "আমার জন্য ২ কেজি মাটন অর্ডার করতে পারবেন?"
 Your JSON Output:
 {{
   "intent": "unsupported_action",
@@ -78,7 +78,7 @@ Your JSON Output:
 }}
 **--- End Example 1 ---**
 
-**--- Example 2: Precise Product Inquiry ---**
+**--- Example 2: Precise Product Inquiry (English) ---**
 User Query: "How spicy is your chicken sausage?"
 Your JSON Output:
 {{
@@ -92,7 +92,7 @@ Your JSON Output:
 }}
 **--- End Example 2 ---**
 
-**--- Example 3: Out of Scope ---**
+**--- Example 3: Out of Scope (English) ---**
 User Query: "Tell me about the founders of Bengal Meat."
 Your JSON Output:
 {{
@@ -105,6 +105,34 @@ Your JSON Output:
   "user_sentiment": "neutral"
 }}
 **--- End Example 3 ---**
+
+**--- Example 4: Purchase Intent (Banglish) ---**
+User Query: "Amar beef steak combo pack ta lagbe, kivabe pabo?"
+Your JSON Output:
+{{
+  "intent": "purchase_intent",
+  "entities": ["beef steak combo pack"],
+  "query_for_retriever": "how to buy products",
+  "k_for_retriever": 1,
+  "metadata_filter": {{"topic": "FAQ - Order Related"}},
+  "response_strategy": "GUIDE_TO_PURCHASE",
+  "user_sentiment": "positive"
+}}
+**--- End Example 4 ---**
+
+**--- Example 5: Product Discovery (Bangla) ---**
+User Query: "আপনাদের কি কি মাছ পাওয়া যায়?"
+Your JSON Output:
+{{
+  "intent": "product_discovery",
+  "entities": ["fish"],
+  "query_for_retriever": "available fish products",
+  "k_for_retriever": 5,
+  "metadata_filter": {{"topic": "Fish items and products"}},
+  "response_strategy": "INFORM_AND_ENGAGE",
+  "user_sentiment": "neutral"
+}}
+**--- End Example 5 ---**
 """),
     ("user",
      """
@@ -121,7 +149,6 @@ Your JSON Output:
 
 # ======================================================================================
 # 3. THE STRATEGIST PROMPTS
-# (This section is unchanged as it doesn't contain hardcoded JSON examples)
 # ======================================================================================
 
 STRATEGIST_PROMPTS = {

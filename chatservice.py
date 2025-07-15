@@ -1,3 +1,4 @@
+import os
 import json
 import sys
 from typing import Dict, Any, Deque, Tuple, Generator
@@ -10,36 +11,65 @@ from core.RetriverService import RetrieverService
 from core.LLMservice import LLMService
 from core.prompts import ANALYST_PROMPT, STRATEGIST_PROMPTS
 from core.config import VECTOR_DB_PATH, MODEL_URL
+from dotenv import load_dotenv
+load_dotenv()
 
 class ProactiveChatService:
     def __init__(self, history_length: int = 100):
-        # NOTE: num_passages_to_retrieve is removed from here.
         print("Initializing ProactiveChatService...")
-        self.retriever = RetrieverService(vector_db_path=VECTOR_DB_PATH) # Simplified init
-        self.llm_service = LLMService(base_url=MODEL_URL)
+        self.retriever = RetrieverService(vector_db_path=VECTOR_DB_PATH)
+        
+        base_url = os.getenv("LLM_MODEL_BASE_URL")
+        api_key = os.getenv("LLM_MODEL_API_KEY")
+        model_name = os.getenv("LLM_MODEL_NAME")
+
+        if not all([base_url, api_key, model_name]):
+            raise ValueError("LLM configuration (BASE_URL, API_KEY, MODEL_NAME) not found in .env file.")
+
+        self.llm_service = LLMService(base_url=base_url, api_key=api_key, model=model_name)
         self.history: Deque[Tuple[str, str]] = deque(maxlen=history_length)
         print(f"✅ ProactiveChatService initialized successfully. History window: {history_length} turns.")
 
     def _format_history(self) -> str:
-        """Formats the conversation history into a readable string for prompts."""
         if not self.history:
             return "No conversation history yet."
         return "\n".join([f"User: {user_q}\nAI: {ai_a}" for user_q, ai_a in self.history])
 
+    # ===================================================================================
+    #   THIS IS THE CORRECTED FUNCTION
+    # ===================================================================================
     def _run_analyst_stage(self, user_input: str, history_str: str) -> Dict[str, Any] | None:
         """Executes the Analyst stage: gets a structured JSON plan from the LLM."""
         print("\n----- 🕵️ Analyst Stage -----")
         prompt = ANALYST_PROMPT.format(history=history_str, question=user_input)
+        response_text = ""
         try:
-            response_text = self.llm_service.invoke(prompt, temperature=0.1, max_tokens=512)
-            plan = json.loads(response_text)
-            print("✅ Analyst plan generated successfully:")
-            print(json.dumps(plan, indent=2))
-            return plan
+            response_text = self.llm_service.invoke(prompt, temperature=0.1, max_tokens=2048)
+
+            # --- START: NEW SANITIZATION LOGIC ---
+            # Find the first '{' and the last '}' to extract the JSON object
+            json_start_index = response_text.find('{')
+            json_end_index = response_text.rfind('}')
+
+            if json_start_index != -1 and json_end_index != -1:
+                clean_json_str = response_text[json_start_index : json_end_index + 1]
+                # Now, try to parse the cleaned string
+                plan = json.loads(clean_json_str)
+                print("✅ Analyst plan parsed successfully after cleaning:")
+                print(json.dumps(plan, indent=2))
+                return plan
+            else:
+                # If we can't find a JSON object, we fail gracefully
+                print("❌ CRITICAL: Could not find a valid JSON object in the LLM's response.")
+                print(f"LLM Response was: '{response_text}'")
+                return None
+            # --- END: NEW SANITIZATION LOGIC ---
+
         except (json.JSONDecodeError, Exception) as e:
-            print(f"❌ CRITICAL: Analyst stage failed: {e}")
+            print(f"❌ CRITICAL: Analyst stage failed even after cleaning: {e}")
+            print(f"Original LLM Response was: '{response_text}'")
             return None
-            
+    
     def _run_retriever_stage(self, plan: Dict[str, Any]) -> Tuple[str, list]:
         """Executes the Retriever stage based on the Analyst's detailed plan."""
         print("\n----- 📚 Retriever Stage -----")
@@ -72,7 +102,7 @@ class ProactiveChatService:
 
         prompt_template = STRATEGIST_PROMPTS.get(strategy)
         if not prompt_template:
-            print(f"❌ WARNING: Invalid strategy '{strategy}'. Defaulting.")
+            print(f"❌ WARNING: Invalid strategy '{strategy}'. Defaulting to RESPOND_WARMLY.")
             prompt_template = STRATEGIST_PROMPTS["RESPOND_WARMLY"]
 
         prompt = prompt_template.format(
@@ -84,19 +114,19 @@ class ProactiveChatService:
         return self.llm_service.stream(
             prompt,
             temperature=0.7,
-            max_tokens=4000,
+            max_tokens=4096,
             top_p=0.9,
             repetition_penalty=1.05
         )
 
     def chat(self, user_input: str) -> Generator[Dict[str, Any], None, None]:
-        """Main entry point, orchestrating the new, more robust pipeline."""
+        """Main entry point, orchestrating the pipeline and yielding structured events."""
         print(f"\n==================== NEW CHAT TURN: User said '{user_input}' ====================")
         history_str = self._format_history()
 
         plan = self._run_analyst_stage(user_input, history_str)
         if not plan:
-            yield {"type": "error", "content": "I'm sorry, I'm having a little trouble. Could you rephrase?"}
+            yield {"type": "error", "content": "I'm sorry, I'm having a little trouble thinking. Could you please rephrase?"}
             return
 
         combined_context, retrieved_passages = self._run_retriever_stage(plan)
@@ -112,9 +142,9 @@ class ProactiveChatService:
             }
         
         final_answer = "".join(full_answer_list).strip()
-
         self.history.append((user_input, final_answer))
-        # sources = list(set([doc.get("url") for doc in retrieved_passages if doc.get("url")]))
+        
+        # sources = list(set([doc["metadata"].get("url", "N/A") for doc in retrieved_passages if doc.get("metadata")]))
         
         # yield {
         #     "type": "final_data",
@@ -122,13 +152,10 @@ class ProactiveChatService:
         # }
         print("\n-------------------- STREAM COMPLETE --------------------")
 
-# --- Example Usage: Simulating a Conversation to Test the Pipeline ---
+
 if __name__ == "__main__":
-    # 1. Initialize the service
-    # Using a shorter history for testing so we can see it being managed.
     chat_service = ProactiveChatService(history_length=5)
     
-    # 2. Define a list of test cases to simulate a conversation
     test_conversation = [
         "Hello!",
         "Do you sell fish?",
@@ -139,27 +166,22 @@ if __name__ == "__main__":
         "Thanks for the help!"
     ]
     
-    # 3. Loop through the conversation and process each turn
     for turn in test_conversation:
         print(f"\n\n\n>>>>>>>>>>>>>>>>>> User Input: {turn} <<<<<<<<<<<<<<<<<<")
         print("\n<<<<<<<<<<<<<<<<<< Bot Response >>>>>>>>>>>>>>>>>>")
         
         final_sources = []
         try:
-            # The client code iterates through the generator yielded by chat()
             for event in chat_service.chat(turn):
                 if event["type"] == "answer_chunk":
-                    # Print each chunk as it arrives to simulate a streaming UI
                     print(event["content"], end="", flush=True)
                 elif event["type"] == "final_data":
-                    # Store the final metadata for display after the stream
                     final_sources = event["content"]["sources"]
                 elif event["type"] == "error":
                     print(event["content"], end="", flush=True)
 
-            # After the stream is complete, print the sources if any were found
             if final_sources:
-                print(f"\n[Sources Found: {', '.join(final_sources)}]")
+                print(f"\n\n[Sources Found: {', '.join(final_sources)}]")
             print("\n<<<<<<<<<<<<<<<<<< End of Response >>>>>>>>>>>>>>>>>>")
 
         except Exception as e:

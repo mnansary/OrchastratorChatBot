@@ -2,21 +2,23 @@
 
 from langchain_community.vectorstores import Chroma
 import warnings
+import os
 from typing import Dict, Any, List
-
+from dotenv import load_dotenv
 # Import your JinaV3Embeddings class from its file
-from .embedding import JinaV3ApiEmbeddings
-from .config import EMBEDDING_PORT, EMBEDDING_HOST
+from .embedding import JinaV3TritonEmbeddings
 warnings.filterwarnings("ignore")
+load_dotenv()
+
 
 class RetrieverService:
-    def __init__(self, vector_db_path: str):
+    def __init__(self):
         """
         Initializes a more powerful, flexible retriever service.
         """
         print("Initializing Advanced RetrieverService...")
-        self.embedding_model = JinaV3ApiEmbeddings(EMBEDDING_HOST, EMBEDDING_PORT)
-        
+        self.embedding_model = JinaV3TritonEmbeddings()
+        vector_db_path = os.getenv("VECTOR_DB_PATH")
         self.vectorstore = Chroma(
             persist_directory=vector_db_path,
             embedding_function=self.embedding_model
@@ -75,13 +77,8 @@ class RetrieverService:
 if __name__ == "__main__":
     import json
 
-    # Path to the vector store you created
-    VECTOR_STORE_PATH = "prototype" 
-    
     # 1. Initialize the service
-    retriever_service = RetrieverService(
-        vector_db_path=VECTOR_STORE_PATH,
-    )
+    retriever_service = RetrieverService()
     
     # --- Example 1: A simple search using default k=3 ---
     print("\n\n--- Example 1: Simple Search (default k=3) ---")

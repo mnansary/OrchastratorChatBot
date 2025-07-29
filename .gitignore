@@ -209,3 +209,4 @@ prototype/*
 extra/*
 debug*
 .gradio
+.vscode/

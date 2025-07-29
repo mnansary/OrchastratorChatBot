@@ -10,23 +10,14 @@ from collections import deque
 from core.RetriverService import RetrieverService
 from core.LLMservice import LLMService
 from core.prompts import ANALYST_PROMPT, STRATEGIST_PROMPTS
-from core.config import VECTOR_DB_PATH, MODEL_URL
 from dotenv import load_dotenv
 load_dotenv()
 
 class ProactiveChatService:
     def __init__(self, history_length: int = 100):
         print("Initializing ProactiveChatService...")
-        self.retriever = RetrieverService(vector_db_path=VECTOR_DB_PATH)
-        
-        base_url = os.getenv("LLM_MODEL_BASE_URL")
-        api_key = os.getenv("LLM_MODEL_API_KEY")
-        model_name = os.getenv("LLM_MODEL_NAME")
-
-        if not all([base_url, api_key, model_name]):
-            raise ValueError("LLM configuration (BASE_URL, API_KEY, MODEL_NAME) not found in .env file.")
-
-        self.llm_service = LLMService(base_url=base_url, api_key=api_key, model=model_name)
+        self.retriever = RetrieverService()
+        self.llm_service = LLMService()
         self.history: Deque[Tuple[str, str]] = deque(maxlen=history_length)
         print(f"✅ ProactiveChatService initialized successfully. History window: {history_length} turns.")
 

@@ -1,179 +1,190 @@
-# core/LLMservice.py
+# llm_service.py
 
-import requests
-import json
-import base64
 import os
+import logging
 from dotenv import load_dotenv
-from typing import Generator, Any
+from openai import OpenAI, BadRequestError
+from pydantic import BaseModel, ValidationError, Field
+from typing import Generator, Any, Type, TypeVar, List
+
+# --- Setup ---
+# Load environment variables from a .env file
+load_dotenv()
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Custom Exceptions for Clarity ---
+class LLMConfigError(Exception):
+    """Custom exception for configuration problems."""
+    pass
+
+class ContextLengthExceededError(Exception):
+    """Custom exception for when a prompt exceeds the model's context window."""
+    pass
+
+# Generic type variable for Pydantic models for clean type hinting.
+PydanticModel = TypeVar("PydanticModel", bound=BaseModel)
+
 
 class LLMService:
     """
-    A self-configuring service class to interact with a vLLM-powered OpenAI-compatible API.
-    It automatically loads its configuration (API key, URL, model name) from a .env file.
+    A synchronous client for OpenAI-compatible APIs using the 'openai' library.
+    It self-configures from your specific environment variables.
     """
     def __init__(self):
         """
-        Initializes the LLMService by loading configuration from environment variables.
-        
-        Raises:
-            ValueError: If any of the required environment variables 
-                        (LLM_MODEL_BASE_URL, LLM_MODEL_API_KEY, LLM_MODEL_NAME) are not set.
+        Initializes the service using environment variables:
+        - LLM_MODEL_BASE_URL
+        - LLM_MODEL_API_KEY
+        - LLM_MODEL_NAME
+        - LLM_MAX_CONTEXT_TOKENS
         """
-        load_dotenv() # Load variables from .env file into the environment
-        
-        self.base_url = os.getenv("LLM_MODEL_BASE_URL")
-        self.api_key = os.getenv("LLM_MODEL_API_KEY")
+        base_url = os.getenv("LLM_MODEL_BASE_URL")
+        api_key = os.getenv("LLM_MODEL_API_KEY")
         self.model = os.getenv("LLM_MODEL_NAME")
+        max_tokens_str = os.getenv("LLM_MAX_CONTEXT_TOKENS")
 
-        if not all([self.base_url, self.api_key, self.model]):
-            raise ValueError(
-                "❌ Configuration Error: One or more required environment variables are missing.\n"
-                "Please ensure your .env file contains:\n"
-                "- LLM_MODEL_BASE_URL\n"
-                "- LLM_MODEL_API_KEY\n"
-                "- LLM_MODEL_NAME"
+        if not all([base_url, api_key, self.model, max_tokens_str]):
+            raise LLMConfigError(
+                "One or more required environment variables are missing. "
+                "Ensure LLM_MODEL_BASE_URL, LLM_MODEL_API_KEY, LLM_MODEL_NAME, "
+                "and LLM_MAX_CONTEXT_TOKENS are set in your .env file."
             )
 
-        self.base_url = self.base_url.rstrip('/')
-        self.chat_url = f"{self.base_url}/v1/chat/completions"
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        print(f"✅ LLMService initialized for model '{self.model}' at endpoint: {self.chat_url}")
+        self.max_context_tokens = int(max_tokens_str)
+        
+        # Initialize the OpenAI client with the loaded configuration
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        
+        logging.info(f"✅ LLMService initialized for model '{self.model}' at URL '{base_url}'.")
 
-    def _process_stream(self, response: requests.Response) -> Generator[str, None, None]:
-        """
-        Processes a streaming HTTP response and yields decoded content chunks.
-        (This method remains unchanged)
-        """
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode('utf-8')
-                if decoded_line.startswith('data: '):
-                    content = decoded_line[len('data: '):]
-                    if content.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(content)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        text_chunk = delta.get("content")
-                        if text_chunk:
-                            yield text_chunk
-                    except json.JSONDecodeError:
-                        print(f"\n[Warning] Could not decode JSON chunk: {content}")
+    def _handle_bad_request(self, e: BadRequestError):
+        """Helper to raise a custom exception for context length errors."""
+        if "context length" in str(e).lower() or "too large" in str(e).lower():
+            logging.error(f"Prompt exceeded context window for model {self.model}.")
+            raise ContextLengthExceededError(f"Prompt is too long for the model's {self.max_context_tokens} token limit.") from e
+        else:
+            logging.error(f"Unhandled BadRequestError: {e}")
+            raise
 
     def invoke(self, prompt: str, **kwargs: Any) -> str:
-        """
-        Sends a request for a single, complete response (non-streaming).
-        (This method remains unchanged)
-        """
+        """Sends a request for a single, complete response (non-streaming)."""
         messages = [{"role": "user", "content": prompt}]
-        payload = {"model": self.model, "messages": messages, "stream": False, **kwargs}
-        
         try:
-            response = requests.post(self.chat_url, headers=self.headers, json=payload, timeout=120)
-            response.raise_for_status()
-            
-            response_data = response.json()
-            
-            if "choices" in response_data and response_data["choices"]:
-                message = response_data["choices"][0].get("message", {})
-                content = message.get("content", "")
-                return content.strip()
-            else:
-                print("❌ ERROR: LLM response is missing 'choices' array or it is empty.")
-                return ""
-
-        except requests.exceptions.HTTPError as e:
-            print(f"\n[Error] HTTP Error during invoke: {e}\nResponse Body: {e.response.text}")
-            return ""
-        except requests.exceptions.RequestException as e:
-            print(f"\n[Error] Network error during invoke: {e}")
-            return ""
-        except json.JSONDecodeError:
-            print(f"\n[Error] Failed to decode JSON from LLM response. Response text: '{response.text}'")
-            return ""
+            response = self.client.chat.completions.create(model=self.model, messages=messages, **kwargs)
+            return response.choices[0].message.content or ""
+        except BadRequestError as e:
+            self._handle_bad_request(e)
+            raise
+        except Exception as e:
+            logging.error(f"An error occurred during invoke: {e}", exc_info=True)
+            raise
 
     def stream(self, prompt: str, **kwargs: Any) -> Generator[str, None, None]:
-        """
-        Connects to the streaming endpoint and yields text chunks as they arrive.
-        (This method remains unchanged)
-        """
+        """Connects to the streaming endpoint and yields text chunks."""
         messages = [{"role": "user", "content": prompt}]
-        payload = {"model": self.model, "messages": messages, "stream": True, **kwargs}
-        
         try:
-            response = requests.post(self.chat_url, headers=self.headers, json=payload, timeout=120, stream=True)
-            response.raise_for_status()
-            yield from self._process_stream(response)
-        except requests.exceptions.RequestException as e:
-            print(f"\n[Error] An error occurred during stream: {e}")
+            stream = self.client.chat.completions.create(model=self.model, messages=messages, stream=True, **kwargs)
+            for chunk in stream:
+                content_chunk = chunk.choices[0].delta.content
+                if content_chunk:
+                    yield content_chunk
+        except BadRequestError as e:
+            self._handle_bad_request(e)
+            raise
+        except Exception as e:
+            logging.error(f"An error occurred during stream: {e}", exc_info=True)
             raise
 
-    def image_stream(self, prompt: str, image_path: str, **kwargs: Any) -> Generator[str, None, None]:
+    def invoke_structured(
+        self, prompt: str, response_model: Type[PydanticModel], **kwargs: Any
+    ) -> PydanticModel:
         """
-        Sends an image and a text prompt for a streaming multi-modal response.
-        (This method remains unchanged)
+        Invokes the model and parses the response into a Pydantic object.
+        Uses the model's native JSON mode for reliable output.
         """
-        try:
-            with open(image_path, "rb") as image_file:
-                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
-        except FileNotFoundError:
-            print(f"\n[Error] Image file not found at: {image_path}")
-            return
-
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}}
-            ]
-        }]
-        payload = {"model": self.model, "messages": messages, "stream": True, **kwargs}
+        structured_prompt = (
+            f"{prompt}\n\n"
+            "Your response MUST be a single, valid JSON object that conforms to the following schema. "
+            "Do not include any other text, explanations, or markdown formatting.\n"
+            f"JSON Schema: {response_model.model_json_schema()}"
+        )
+        messages = [{"role": "user", "content": structured_prompt}]
 
         try:
-            response = requests.post(self.chat_url, headers=self.headers, json=payload, timeout=180, stream=True)
-            response.raise_for_status()
-            yield from self._process_stream(response)
-        except requests.exceptions.RequestException as e:
-            print(f"\n[Error] An error occurred during image stream: {e}")
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages, response_format={"type": "json_object"}, **kwargs
+            )
+            json_response_str = response.choices[0].message.content
+            if not json_response_str:
+                raise ValueError("The model returned an empty JSON response.")
+            
+            return response_model.model_validate_json(json_response_str)
+            
+        except BadRequestError as e:
+            self._handle_bad_request(e)
+            raise
+        except ValidationError as e:
+            logging.error(f"Pydantic validation failed for model response. Error: {e}")
+            logging.error(f"Raw model output was: {json_response_str}")
+            raise
+        except Exception as e:
+            logging.error(f"An error occurred during structured invoke: {e}", exc_info=True)
             raise
 
-# This block demonstrates how to use the self-configuring LLMService class.
-# It assumes you have a .env file in the same directory with the required variables.
+
+# ======================================================================================
+#   TESTING BLOCK: Run this file directly to test the LLMService
+# ======================================================================================
 if __name__ == "__main__":
     
+    # Define a simple Pydantic model for the structured output test
+    class AnalysisResult(BaseModel):
+        summary: str = Field(description="A brief summary of the text.")
+        keywords: List[str] = Field(description="A list of 3-5 main keywords.")
+
     try:
-        # --- Initialize the service ---
-        # No parameters needed; it configures itself from the .env file.
+        # 1. Initialize the service (it will read from your .env file)
         llm_service = LLMService()
 
-        # --- Example 1: Non-streaming text generation using invoke() ---
-        print("\n" + "="*20 + " EXAMPLE 1: INVOKE " + "="*20)
-        prompt_invoke = "Explain what an API gateway is in simple terms."
-        print(f"👤 User Prompt: {prompt_invoke}")
-        print("🤖 AI Response (Invoke):")
-        response_invoke = llm_service.invoke(prompt_invoke, max_tokens=150)
-        print(response_invoke)
-        print("="*55)
-
-        # --- Example 2: Streaming text generation using stream() ---
+        # ==================== EXAMPLE 1: invoke() ====================
+        print("\n" + "="*20 + " EXAMPLE 1: INVOKE (Non-streaming) " + "="*20)
+        invoke_prompt = "Explain the concept of a Large Language Model in one sentence."
+        print(f"👤 User Prompt: {invoke_prompt}")
+        response = llm_service.invoke(invoke_prompt, temperature=0.5, max_tokens=100)
+        print(f"🤖 AI Response:\n{response}")
+        print("="*65)
+        
+        # ==================== EXAMPLE 2: stream() ====================
         print("\n" + "="*20 + " EXAMPLE 2: STREAM " + "="*20)
-        prompt_stream = "List three benefits of using Docker for application deployment."
-        print(f"👤 User Prompt: {prompt_stream}")
-        print("🤖 AI Response (Stream):")
-        full_response_stream = ""
-        try:
-            for chunk in llm_service.stream(prompt_stream, max_tokens=150):
-                print(chunk, end="", flush=True)
-                full_response_stream += chunk
-            print() # for a new line after the stream finishes
-        except Exception as e:
-            print(f"An error occurred during the streaming example: {e}")
-        print("="*55)
+        stream_prompt = "List three benefits of using Python for data science."
+        print(f"👤 User Prompt: {stream_prompt}")
+        print("🤖 AI Response (streaming):")
+        full_response = ""
+        for chunk in llm_service.stream(stream_prompt, temperature=0.7, max_tokens=150):
+            print(chunk, end="", flush=True)
+            full_response += chunk
+        print("\n" + "="*54)
 
-    except ValueError as e:
-        # This will catch the error from __init__ if the .env file is misconfigured
-        print(e)
+        # ==================== EXAMPLE 3: invoke_structured() ====================
+        print("\n" + "="*20 + " EXAMPLE 3: INVOKE_STRUCTURED (JSON) " + "="*20)
+        structured_prompt = "Analyze the following text: 'The sun is a star at the center of the Solar System. It is a nearly perfect ball of hot plasma, heated to incandescence by nuclear fusion reactions in its core.'"
+        print(f"👤 User Prompt: {structured_prompt}")
+        try:
+            structured_response = llm_service.invoke_structured(
+                structured_prompt, 
+                AnalysisResult, 
+                temperature=0.1
+            )
+            print("🤖 AI Response (Pydantic Object):")
+            print(structured_response)
+            print(f"\nType of response: {type(structured_response)}")
+            print(f"Accessing data: structured_response.summary = '{structured_response.summary}'")
+        except Exception as e:
+            print(f"❌ Structured call failed: {e}")
+        print("="*68)
+
+    except LLMConfigError as e:
+        print(f"❌ CONFIGURATION ERROR: {e}")
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred during the test: {e}")

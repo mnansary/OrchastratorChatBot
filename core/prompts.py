@@ -1,9 +1,12 @@
+# prompts.py
+
 from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+from typing import Literal, List # Literal is used for the Pydantic model
 
 # ======================================================================================
 # 1. CORE BOT IDENTITY (BOILERPLATE)
 # ======================================================================================
-# This section remains unchanged and is correct.
 BOILERPLATE_TEXT = """You are a specialized AI assistant for Bengal Meat, a premium meat provider. 
 Your primary role is to be a helpful, friendly, and proactive sales agent bot who provides accurate information based 
 *only* on the reference text provided to you. Do not use any external knowledge or make assumptions. 
@@ -22,47 +25,58 @@ and other actions that require tools you do not have.
 """
 
 # ======================================================================================
-# 2. THE ANALYST PROMPT (Updated with Multilingual Examples)
+# 2. Pydantic Model for the Analyst's Plan
+# ======================================================================================
+
+class AnalystPlan(BaseModel):
+    """
+    A structured plan created by the Analyst LLM call.
+    It determines WHAT to search for and HOW to respond.
+    """
+    query_for_retriever: str = Field(
+        description="A clean, keyword-focused query for the vector database. Should be an empty string if no retrieval is needed."
+    )
+    response_strategy: Literal[
+        "INFORM_AND_ENGAGE",
+        "DETAIL_AND_SELL",
+        "GUIDE_TO_PURCHASE",
+        "INSPIRE_WITH_RECIPE",
+        "HANDLE_SERVICE_ISSUE",
+        "REDIRECT_AND_CLARIFY",
+        "APOLOGIZE_AND_STATE_LIMITS",
+        "RESPOND_WARMLY",
+    ] = Field(description="The strategy to use for generating the final response.")
+
+
+# ======================================================================================
+# 3. THE REVISED ANALYST PROMPT
 # ======================================================================================
 
 ANALYST_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      f"{BOILERPLATE_TEXT}"
      """
-Your entire job is to be a master analyst. You must meticulously analyze the user's query, history, and your own capabilities to create a structured JSON plan for the sales agent. Your output MUST be a single, valid JSON object.
-### THE OUTPUT HAS TO BE IN ENGLISH
+Your entire job is to be a master analyst. You must meticulously analyze the user's query and history to create a structured JSON plan. Your output MUST be a single, valid JSON object that conforms to the required schema.
+
 ### JSON Schema Definition:
 {{
-  "intent": "...",
-  "entities": ["...", "..."],
   "query_for_retriever": "A clean, keyword-focused query for the vector database.",
-  "k_for_retriever": <integer>,
-  "metadata_filter": {{ "topic": "value" }} or null,
-  "response_strategy": "...",
-  "user_sentiment": "positive|neutral|negative"
+  "response_strategy": "The chosen strategy for the final response."
 }}
 
-### Intent Definitions:
-- `product_discovery`: General questions about product categories.
-- `product_inquiry`: Specific question about a known product.
-- `purchase_intent`: User wants to buy or order.
-- `recipe_inquiry`: User wants cooking instructions.
-- `customer_service`: Non-product issue like delivery, payment, refund.
-- `unsupported_action`: User asks you to do something you CANNOT do (e.g., "place my order").
-- `out_of_scope_query`: User asks about a topic you DO NOT have info on (e.g., "company history").
-- `chit_chat`: Conversational filler.
+### Response Strategy Definitions (Choose one):
+- `INFORM_AND_ENGAGE`: User is asking about a general category of products (e.g., "what fish do you have?").
+- `DETAIL_AND_SELL`: User is asking for a specific detail about a known product (e.g., "is the sausage spicy?").
+- `GUIDE_TO_PURCHASE`: User expresses intent to buy or wants to know how to order.
+- `INSPIRE_WITH_RECIPE`: User wants cooking instructions or recipe ideas.
+- `HANDLE_SERVICE_ISSUE`: User has a non-product issue like delivery, payment, or refunds.
+- `REDIRECT_AND_CLARIFY`: User asks you to do something you CANNOT do (e.g., "place my order").
+- `APOLOGIZE_AND_STATE_LIMITS`: User asks about a topic you DO NOT have info on (e.g., "company history").
+- `RESPOND_WARMLY`: For conversational filler, greetings, or thank yous.
 
-### Response Strategy Definitions:
-- `INFORM_AND_ENGAGE`: For `product_discovery`.
-- `DETAIL_AND_SELL`: For `product_inquiry`.
-- `GUIDE_TO_PURCHASE`: For `purchase_intent`.
-- `INSPIRE_WITH_RECIPE`: For `recipe_inquiry`.
-- `HANDLE_SERVICE_ISSUE`: For `customer_service`.
-- `REDIRECT_AND_CLARIFY`: For `unsupported_action`. Explain what you can't do and what they can do.
-- `APOLOGIZE_AND_STATE_LIMITS`: For `out_of_scope_query`. Apologize and state what you CAN talk about.
-- `RESPOND_WARMLY`: For `chit_chat`.
-
-THE NAMES MUST STAY SAME AND IN CAPITAL
+### Your Task:
+1.  **Determine the `response_strategy`** based on the user's intent.
+2.  **Create the `query_for_retriever`**. This should be a search query if the strategy requires information. If the strategy is `APOLOGIZE_AND_STATE_LIMITS` or `RESPOND_WARMLY`, the query should be an empty string `""`.
 
 ### Examples:
 
@@ -70,13 +84,8 @@ THE NAMES MUST STAY SAME AND IN CAPITAL
 User Query: "আমার জন্য ২ কেজি মাটন অর্ডার করতে পারবেন?"
 Your JSON Output:
 {{
-  "intent": "unsupported_action",
-  "entities": ["order", "mutton"],
   "query_for_retriever": "how to place an order",
-  "k_for_retriever": 1,
-  "metadata_filter": {{"topic": "FAQ - Order Related"}},
-  "response_strategy": "REDIRECT_AND_CLARIFY",
-  "user_sentiment": "neutral"
+  "response_strategy": "REDIRECT_AND_CLARIFY"
 }}
 **--- End Example 1 ---**
 
@@ -84,13 +93,8 @@ Your JSON Output:
 User Query: "How spicy is your chicken sausage?"
 Your JSON Output:
 {{
-  "intent": "product_inquiry",
-  "entities": ["chicken sausage", "spice level"],
   "query_for_retriever": "spice level and flavor of chicken sausage",
-  "k_for_retriever": 2,
-  "metadata_filter": {{"topic": "Sausages items and products"}},
-  "response_strategy": "DETAIL_AND_SELL",
-  "user_sentiment": "neutral"
+  "response_strategy": "DETAIL_AND_SELL"
 }}
 **--- End Example 2 ---**
 
@@ -98,27 +102,17 @@ Your JSON Output:
 User Query: "Tell me about the founders of Bengal Meat."
 Your JSON Output:
 {{
-  "intent": "out_of_scope_query",
-  "entities": ["founders", "company history"],
   "query_for_retriever": "",
-  "k_for_retriever": 0,
-  "metadata_filter": null,
-  "response_strategy": "APOLOGIZE_AND_STATE_LIMITS",
-  "user_sentiment": "neutral"
+  "response_strategy": "APOLOGIZE_AND_STATE_LIMITS"
 }}
 **--- End Example 3 ---**
 
-**--- Example 4: Purchase Intent (Banglish) ---**
-User Query: "Amar beef steak combo pack ta lagbe, kivabe pabo?"
+**--- Example 4: Conversational (English) ---**
+User Query: "thank you"
 Your JSON Output:
 {{
-  "intent": "purchase_intent",
-  "entities": ["beef steak combo pack"],
-  "query_for_retriever": "how to buy products",
-  "k_for_retriever": 1,
-  "metadata_filter": {{"topic": "FAQ - Order Related"}},
-  "response_strategy": "GUIDE_TO_PURCHASE",
-  "user_sentiment": "positive"
+  "query_for_retriever": "",
+  "response_strategy": "RESPOND_WARMLY"
 }}
 **--- End Example 4 ---**
 
@@ -126,13 +120,8 @@ Your JSON Output:
 User Query: "আপনাদের কি কি মাছ পাওয়া যায়?"
 Your JSON Output:
 {{
-  "intent": "product_discovery",
-  "entities": ["fish"],
   "query_for_retriever": "available fish products",
-  "k_for_retriever": 5,
-  "metadata_filter": {{"topic": "Fish items and products"}},
-  "response_strategy": "INFORM_AND_ENGAGE",
-  "user_sentiment": "neutral"
+  "response_strategy": "INFORM_AND_ENGAGE"
 }}
 **--- End Example 5 ---**
 """),
@@ -150,7 +139,7 @@ Your JSON Output:
 
 
 # ======================================================================================
-# 3. THE STRATEGIST PROMPTS
+# 4. THE STRATEGIST PROMPTS
 # ======================================================================================
 
 STRATEGIST_PROMPTS = {
@@ -274,21 +263,10 @@ You are a calm, empathetic, and highly efficient customer service representative
 
       **User's Comment:** "{question}"
 
-      **Example 1 (After a successful query):**
-      History: "...AI: The Ribeye steak is ৳1500 per kg."
-      User's Comment: "thank you"
-      Your Response: "You're most welcome! Let me know if you'd like to know more about our steaks."
-
-      **Example 2 (Simple agreement):**
-      History: "...AI: You can find our outlets in Dhanmondi and Gulshan."
-      User's Comment: "okay"
-      Your Response: "Great! Is there anything else I can help you find today?"
-
       **Your Response:**
       """
       ),
 
-    
     "REDIRECT_AND_CLARIFY": ChatPromptTemplate.from_template(
         f"System: {BOILERPLATE_TEXT}\n"
         """
@@ -324,11 +302,6 @@ You are a helpful and honest assistant. The user has asked you to perform an act
     {history}
 
     **Out-of-Scope Question:** "{question}"
-
-    **Example:**
-    History: "User: Do you have Mutton Rezala? AI: Yes, we have a delicious Ready-to-Cook Mutton Rezala!"
-    Out-of-Scope Question: "Who is the CEO of Bengal Meat?"
-    Your Response: "I'm sorry, but I don't have access to information about company executives. However, if you'd like, I can tell you more about the Mutton Rezala we were just discussing, like its ingredients or cooking instructions. Would that be helpful?"
 
     **Your Response:**
     """

@@ -145,99 +145,86 @@ class AsyncLLMService:
             logging.error(f"An error occurred during tool invocation: {e}", exc_info=True)
             raise
 
+    # FILE: models/qwen3async_llm.py
+
     async def stream_with_tool_calls(
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         available_tools: Dict[str, callable],
-        **kwargs: Any  # <-- FIX: Accept kwargs
+        **kwargs: Any
     ) -> AsyncGenerator[str, None]:
-        """Handles a multi-step conversation with tool-calling capabilities, streaming the results asynchronously."""
+        """
+        Handles a multi-step conversation with tool-calling capabilities by looping until a final,
+        text-only response is generated, which is then streamed to the user.
+        """
+        MAX_TOOL_ITERATIONS = 5
+        iteration = 0
+
         try:
-            print("\n   [Step 1: Streaming model response to check for tool calls...]")
+            while iteration < MAX_TOOL_ITERATIONS:
+                iteration += 1
+                print(f"\n   [Loop Iteration #{iteration}: Requesting action from model...]")
+                
+                # Step 1: Get the model's complete next action (text or tool call) in a non-streaming way.
+                response = await self.client.chat.completions.create(
+                    model=self.model, messages=messages, tools=tools, tool_choice="auto", **kwargs
+                )
+                response_message = response.choices[0].message
+                tool_calls = response_message.tool_calls
 
-            stream = await self.client.chat.completions.create(
-                model=self.model, messages=messages, tools=tools, tool_choice="auto", stream=True, **kwargs # <-- FIX: Pass kwargs
-            )
+                # Case 1: The model's response contains tool calls.
+                if tool_calls:
+                    print(f"   [Decision: {len(tool_calls)} tool call(s) detected. Executing silently...]")
+                    messages.append(response_message)  # Append the assistant's decision to call tools.
 
-            response_message = {"role": "assistant", "content": "", "tool_calls": []}
-            tool_call_index_map = {}
-
-            async for chunk in stream:
-                if not chunk.choices:
+                    for tool_call in tool_calls:
+                        function_name = tool_call.function.name
+                        function_to_call = available_tools.get(function_name)
+                        if function_to_call:
+                            try:
+                                function_args = json.loads(tool_call.function.arguments or "{}")
+                                if asyncio.iscoroutinefunction(function_to_call):
+                                    function_response = await function_to_call(**function_args)
+                                else:
+                                    function_response = await asyncio.to_thread(function_to_call, **function_args)
+                                
+                                messages.append({
+                                    "tool_call_id": tool_call.id, "role": "tool",
+                                    "name": function_name, "content": str(function_response)
+                                })
+                            except Exception as e:
+                                logging.error(f"Error executing tool '{function_name}': {e}", exc_info=True)
+                                messages.append({
+                                    "tool_call_id": tool_call.id, "role": "tool",
+                                    "name": function_name, "content": f"Error: Tool execution failed with message: {e}"
+                                })
+                        else:
+                            logging.warning(f"Model tried to call an unknown tool: {function_name}")
+                    
+                    # Continue the loop to send the tool results back to the model for the next step.
                     continue
-                delta = chunk.choices[0].delta
 
-                if delta.content:
-                    response_message["content"] += delta.content
-                    yield delta.content
-
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        index = tc_delta.index if tc_delta.index is not None else 0
-                        if index not in tool_call_index_map:
-                            tool_call_index_map[index] = {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""}
-                            }
-
-                        if tc_delta.id:
-                            tool_call_index_map[index]["id"] += tc_delta.id
-                        if tc_delta.type:
-                            tool_call_index_map[index]["type"] = tc_delta.type
-                        if tc_delta.function and tc_delta.function.name:
-                            tool_call_index_map[index]["function"]["name"] += tc_delta.function.name
-                        if tc_delta.function and tc_delta.function.arguments:
-                            tool_call_index_map[index]["function"]["arguments"] += tc_delta.function.arguments
-
-            response_message["tool_calls"] = list(tool_call_index_map.values())
-            tool_calls = response_message["tool_calls"]
-
-            if not tool_calls:
-                print("   [Model responded directly without using a tool.]")
-                return
-
-            print("   [Step 2: Model requested tool calls. Executing them...]")
-
-            messages.append(response_message)
-
-            for tool_call in tool_calls:
-                function_name = tool_call["function"]["name"]
-                function_to_call = available_tools.get(function_name)
-
-                if function_to_call:
-                    function_args = json.loads(tool_call["function"]["arguments"] or "{}")
-                    if asyncio.iscoroutinefunction(function_to_call):
-                        function_response = await function_to_call(**function_args)
-                    else:
-                        function_response = function_to_call(**function_args)
-                    messages.append({
-                        "tool_call_id": tool_call["id"],
-                        "role": "tool",
-                        "name": function_name,
-                        "content": str(function_response),
-                    })
+                # Case 2: The model's response has NO tool calls. This is the final answer.
                 else:
-                    logging.warning(f"Model tried to call an unknown tool: {function_name}")
-
-            print("   [Step 3: Streaming final answer from model...]")
-
-            final_stream = await self.client.chat.completions.create(
-                model=self.model, messages=messages, stream=True, **kwargs # <-- FIX: Pass kwargs
-            )
-
-            async for chunk in final_stream:
-                if not chunk.choices:
-                    continue
-                content_chunk = chunk.choices[0].delta.content
-                if content_chunk:
-                    yield content_chunk
+                    print("   [Decision: No tool calls. This is the final answer. Begin streaming.]")
+                    # The response we already received contains the complete final answer.
+                    # We can now "stream" it back chunk by chunk.
+                    if response_message.content:
+                        for char in response_message.content:
+                            yield char
+                            await asyncio.sleep(0.001) # Small sleep to simulate streaming
+                    return # Exit the function successfully.
+            
+            # If the loop finishes, it means we hit the max iterations.
+            logging.error("Max tool iterations reached. Aborting.")
+            yield "দুঃখিত, একটি জটিল সমস্যা হয়েছে এবং আমি আপনার অনুরোধটি সম্পন্ন করতে পারছি না।"
 
         except Exception as e:
             logging.error(f"An error occurred during streaming tool invocation: {e}", exc_info=True)
+            yield "দুঃখিত, একটি প্রযুক্তিগত ত্রুটির কারণে আমি এই মুহূর্তে সাহায্য করতে পারছি না।"
             raise
-
+        
 async def main():
     # --- Pydantic Models for Testing ---
     class NIDInfo(BaseModel):

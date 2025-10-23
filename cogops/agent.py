@@ -44,19 +44,21 @@ class ChatAgent:
         self.agent_name = self.config.get('agent_name', 'Bengal Meat Assistant')
         self.agent_story = self.config.get('agent_story', 'I am a helpful AI assistant from Bengal Meat.')
 
+        # --- User Context Storage ---
+        # This dictionary will be populated with data from private tools for logged-in users.
+        self.user_context: Dict[str, Any] = {}
+
         # --- Initialize LLM Service ---
         self.llm_service = self._initialize_llm_service()
 
-        # --- CORRECTED: Initialize Tokenizer ---
-        # The tokenizer should use the same model as the LLM service for accurate counting,
-        # as defined in the config file.
+        # --- Initialize Tokenizer ---
+        # The tokenizer uses the same model as the LLM service for accurate counting.
         logging.info(f"Initializing TokenManager with model: {self.llm_service.model}")
         self.token_manager = TokenManager(
             model_name=self.llm_service.model,
-            reservation_tokens=0, # Not used in the new prompt structure
-            history_budget=1.0   # Not used in the new prompt structure
+            reservation_tokens=0,
+            history_budget=1.0
         )
-        # ----------------------------------------
 
         # --- Conversation and Tool Management ---
         self.history: List[Tuple[str, str]] = []
@@ -68,7 +70,44 @@ class ChatAgent:
         self.tool_functions = available_tools_map
         self.tools_description = json.dumps(self.tools_schema, indent=4)
 
-        logging.info("✅ ChatAgent initialized successfully for the session.")
+        logging.info("✅ ChatAgent object created. Context enrichment pending.")
+
+    async def _enrich_context(self):
+        """
+        Autonomously calls private tools at the start of a session for a logged-in user
+        to gather context (profile, order history, etc.). This method is called by the API service
+        immediately after the agent is instantiated.
+        """
+        if not self.session_meta.get('user_id'):
+            logging.info("Guest user session. Skipping context enrichment.")
+            return
+
+        logging.info(f"Registered user detected (ID: {self.session_meta['user_id']}). Starting context enrichment...")
+        
+        # --- CORRECTED SECTION ---
+        # Instead of calling the functions directly, we wrap them in asyncio.to_thread()
+        # to create awaitable tasks that run the blocking code in a separate thread.
+        tasks = [
+            asyncio.to_thread(self.tool_functions["fetch_user_profile"], self.session_meta),
+            asyncio.to_thread(self.tool_functions["fetch_user_order_history"], self.session_meta),
+            asyncio.to_thread(self.tool_functions["fetch_user_loyalty_status"], self.session_meta)
+        ]
+        # --- END OF CORRECTION ---
+
+        # Run all tasks in parallel and get results, allowing for individual failures
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Unpack results safely, checking for exceptions before assigning to context
+        profile, history, loyalty = results
+
+        if not isinstance(profile, Exception) and profile:
+            self.user_context["profile"] = profile
+        if not isinstance(history, Exception) and history:
+            self.user_context["order_history"] = history
+        if not isinstance(loyalty, Exception) and loyalty:
+            self.user_context["loyalty"] = loyalty
+        
+        logging.info(f"Context enrichment complete. Context gathered: {list(self.user_context.keys())}")
 
     def _load_config(self, config_path: str) -> Dict:
         logging.info(f"Loading configuration from: {config_path}")
@@ -98,17 +137,26 @@ class ChatAgent:
         return "\n---\n".join([f"User: {u}\nAI: {a}" for u, a in self.history])
 
     async def generate_welcome_message(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Generates a welcome message that is personalized if user context (e.g., name) was successfully fetched.
+        """
         logging.info("Generating welcome message for the session.")
-        user_id = self.session_meta.get('user_id')
+        user_name = self.user_context.get("profile", {}).get("name")
 
-        if user_id:
-            welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
+        if user_name:
+            # Personalized welcome for registered users
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম, {user_name}! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
         else:
+            # Templated welcome for guest users (or if profile fetch failed)
             welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম! আমি {self.agent_name}। আমি আপনাকে আমাদের পণ্য, অফার এবং স্টোর খুঁজে পেতে সাহায্য করতে পারি। বলুন, কীভাবে শুরু করতে পারি?"
 
         yield {"type": "welcome_message", "content": welcome_text}
         
     async def process_query(self, user_query: str) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Processes a user's query by constructing a detailed prompt with all available context
+        and orchestrating LLM and tool calls.
+        """
         logging.info(f"\n--- Processing Query: '{user_query}' for store_id: {self.session_meta.get('store_id')} ---")
         
         try:
@@ -120,7 +168,8 @@ class ChatAgent:
                 tools_description=self.tools_description,
                 conversation_history=conversation_history_str,
                 user_query=user_query,
-                session_meta=self.session_meta
+                session_meta=self.session_meta,
+                user_context=self.user_context  # Pass the enriched context to the prompt
             )
             
             messages = [

@@ -10,27 +10,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Configuration ---
-# This script requires the COMPANY_API_BASE_URL environment variable.
 BASE_URL = os.getenv("COMPANY_API_BASE_URL")
 if not BASE_URL:
     raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# A placeholder for guest user ID as seen in the API examples.
-# The API may not require it, but we pass it for consistency with the provided collection.
+# This is the default/fallback ID for guest users.
 GUEST_CUSTOMER_ID = 369
 
-def get_active_promotions(store_id: int) -> List[Dict[str, str]]:
+
+# --- REFINED FUNCTION ---
+def get_active_promotions(store_id: int, session_meta: Dict[str, Any]) -> List[Dict[str, str]]:
     """
-    Gets a list of all currently active promotions, discounts, and special offers for a specific store.
-    Use this when a user asks about offers, discounts, or current promotions.
+    Gets a list of all currently active promotions for a specific store.
+    It uses the customer_id from session_meta if available for potentially personalized promotions.
+    Use this when a user asks about offers, discounts, or current deals.
 
     Args:
         store_id: The ID of the store to check for promotions.
+        session_meta: The user's session data, which may contain a 'user_id'.
     """
-    api_url = f"{BASE_URL}/data-driven-promotion/activePromotionList/Web/{store_id}/{GUEST_CUSTOMER_ID}"
-    logging.info(f"Requesting active promotions for store_id '{store_id}' from: {api_url}")
+    # Dynamically select customer_id: use real ID if logged in, otherwise fallback to guest ID.
+    customer_id_to_use = session_meta.get('user_id') or GUEST_CUSTOMER_ID
+
+    api_url = f"{BASE_URL}/data-driven-promotion/activePromotionList/Web/{store_id}/{customer_id_to_use}"
+    logging.info(f"Requesting active promotions for store_id '{store_id}' and customer_id '{customer_id_to_use}' from: {api_url}")
 
     try:
         response = requests.get(api_url, timeout=15)
@@ -48,36 +53,43 @@ def get_active_promotions(store_id: int) -> List[Dict[str, str]]:
             for promo in promotions_data
         ]
 
-        logging.info(f"Successfully retrieved {len(simplified_promotions)} active promotions for store_id '{store_id}'.")
+        logging.info(f"Successfully retrieved {len(simplified_promotions)} active promotions.")
         return simplified_promotions
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to fetch active promotions for store_id '{store_id}'. Error: {e}")
+        logging.error(f"Failed to fetch active promotions. Error: {e}")
         return []
 
-def get_all_products_for_store(store_id: int) -> List[Dict[str, Any]]:
+
+# --- REFINED FUNCTION ---
+def get_all_products_for_store(store_id: int, session_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     An efficient function to fetch a comprehensive list of all products available at a specific store.
-    Use this for broad queries like 'What do you have in stock?', 'List all your products', or when a user wants a general overview.
+    It uses the customer_id from session_meta if available to fetch personalized prices.
+    Use this for broad queries like 'What do you have in stock?' or 'List all your products'.
 
     Args:
         store_id: The ID of the store for which to fetch the product list.
+        session_meta: The user's session data, which may contain a 'user_id'.
     """
     api_url = f"{BASE_URL}/product/productListForChatbot"
-    logging.info(f"Requesting full product list for store_id '{store_id}' from: {api_url}")
+    
+    # Dynamically select customer_id
+    customer_id_to_use = session_meta.get('user_id') or GUEST_CUSTOMER_ID
+    
+    logging.info(f"Requesting full product list for store_id '{store_id}' and customer_id '{customer_id_to_use}'.")
 
     payload = {
         "store_id": str(store_id),
         "company_id": 1,
         "order_by": "popularity",
-        "customer_id": GUEST_CUSTOMER_ID
+        "customer_id": customer_id_to_use
     }
 
     try:
         response = requests.post(api_url, json=payload, timeout=20)
         response.raise_for_status()
         
-        # The API returns a dictionary where the key is the store_id as a string.
         product_list = response.json().get('data', {}).get(str(store_id), [])
 
         simplified_list = [
@@ -99,22 +111,30 @@ def get_all_products_for_store(store_id: int) -> List[Dict[str, Any]]:
         logging.error(f"Failed to fetch chatbot product list for store_id '{store_id}'. Error: {e}")
         return []
 
-def get_product_details(product_id: int, store_id: int) -> Optional[Dict[str, Any]]:
+
+# --- REFINED FUNCTION ---
+def get_product_details(product_id: int, store_id: int, session_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Retrieves exhaustive details for a single product by its ID and store.
-    Use this as a follow-up when a user asks for more information about a specific product found via search or category listing.
+    Retrieves exhaustive details for a single product.
+    It uses the customer_id from session_meta if available to fetch personalized prices.
+    Use this as a follow-up when a user asks for more information about a specific product.
 
     Args:
         product_id: The unique ID of the product.
         store_id: The ID of the store to check for availability and details.
+        session_meta: The user's session data, which may contain a 'user_id'.
     """
     api_url = f"{BASE_URL}/product/getListOfProductDetails"
-    logging.info(f"Requesting details for product_id '{product_id}' at store_id '{store_id}'.")
+    
+    # Dynamically select customer_id
+    customer_id_to_use = session_meta.get('user_id') or GUEST_CUSTOMER_ID
+    
+    logging.info(f"Requesting details for product_id '{product_id}' at store_id '{store_id}' for customer_id '{customer_id_to_use}'.")
 
     payload = {
         "product_id": product_id,
         "store_id": store_id,
-        "customer_id": GUEST_CUSTOMER_ID
+        "customer_id": customer_id_to_use
     }
 
     try:
@@ -127,19 +147,16 @@ def get_product_details(product_id: int, store_id: int) -> Optional[Dict[str, An
             logging.warning(f"No details found for product_id '{product_id}' at store_id '{store_id}'.")
             return None
 
-        # Assuming the first item in the list is the product we want.
         details = product_data[0]
         
-        # Simplify the response for the LLM. The raw API response for this could be very large.
         simplified_details = {
             "name": details.get("name"),
-            "description": details.get("details"), # The 'details' field seems to contain rich HTML description
+            "description": details.get("details"),
             "price_bdt": details.get("mrp"),
             "weight_gm": details.get("weight_in_gm"),
             "stock_quantity": details.get("stockQuantity"),
             "is_in_stock": "Yes" if details.get("stockQuantity", 0) > 0 else "No",
-            "category": details.get("product_category_name"),
-            "image_url": details.get("image")
+            "category": details.get("product_category_name")
         }
 
         logging.info(f"Successfully retrieved details for product_id '{product_id}'.")

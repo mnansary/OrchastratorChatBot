@@ -8,7 +8,7 @@ from openai import AsyncOpenAI, APIError, BadRequestError
 from typing import Any, Type, TypeVar, AsyncGenerator, List, Dict
 from pydantic import BaseModel, Field
 from cogops.utils.prompt import build_structured_prompt
-from cogops.tools import tools_list, available_tools_map
+from cogops.tools.tools import tools_list, available_tools_map
 # Load environment variables and set up logging
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

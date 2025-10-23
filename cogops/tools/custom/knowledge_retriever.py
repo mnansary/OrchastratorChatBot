@@ -13,12 +13,13 @@ from collections import defaultdict
 import yaml
 import chromadb
 from typing import List, Dict, Any, Tuple
-
+from dotenv import load_dotenv
+load_dotenv()
 # --- Custom Module Imports ---
 # Adjust these paths based on your actual project structure
 from cogops.retriver.vector_search import VectorRetriever  # Assuming this is where VectorRetriever is defined
 
-CONFIG_CONSTANT=os.path.expanduser("~/CogOpsCB/configs/config.yaml")
+CONFIG_CONSTANT=os.getenv("CONFIG_FILE_PATH")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,38 +40,3 @@ async def retrieve_knowledge(query: str) -> List[Dict[str, Any]]:
     finally:
         retriever.close()
 
-# --- Available Tools Map (function name to callable) ---
-available_tools_map = {
-    "get_current_time": get_current_time,
-    "retrieve_knowledge": retrieve_knowledge
-}
-
-# --- OpenAI-Compatible Tools List (tool definitions) ---
-tools_list = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "Get the current date and time.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "retrieve_knowledge",
-            "description": "Retrieve relevant passages from the knowledge base based on a query.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                },
-                "required": ["query"]
-            }
-        }
-    }
-]

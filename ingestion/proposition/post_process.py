@@ -85,12 +85,8 @@ def process_files(csv_path: str, json_folder_path: str, output_folder_path: str)
             # Construct the final JSON object
             output_data = {
                 'passage_id': passage_id,
-                'category': csv_row.get('Category'),
-                'sub_category': csv_row.get('Sub-Category'),
-                'service': csv_row.get('Service'),
                 'topic': topic,
                 'text': csv_row.get('Text'),
-                'url': csv_row.get('URL'),
                 'date': datetime.now().isoformat(),
                 'propositions': propositions_list,
                 'summaries': summaries_list,

@@ -68,7 +68,7 @@ def ingest_to_postgres(db_manager: SQLDatabaseManager, all_json_data: list):
     
     postgres_records = []
     # These are the columns for the 'passages' table
-    postgres_columns = ['passage_id', 'category', 'sub_category', 'service', 'topic', 'text', 'url', 'date']
+    postgres_columns = ['passage_id', 'topic', 'text','date']
 
     for data in all_json_data:
         # Create a record with only the keys relevant to PostgreSQL

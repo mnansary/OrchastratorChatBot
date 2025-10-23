@@ -121,52 +121,53 @@ def create_prompt(passage_data: Dict[str, Any]) -> str:
 
     return f"""
 **ROLE:**
-You are an expert semantic analyst specializing in creating high-quality, structured data from text for Retrieval-Augmented Generation (RAG) systems. Your output must be flawless, unambiguous, and machine-readable.
+You are an expert semantic analyst specializing in creating high-quality, structured data about the company **Bengal Meat** for Retrieval-Augmented Generation (RAG) systems. Your output must be flawless, unambiguous, and machine-readable.
 
 **PRIMARY GOAL:**
-Deconstruct the provided Bengali text into its core components:
-1.  **Propositions:** A series of fully disambiguated and self-contained informational chunks.
-2.  **Question Patterns:** A list of all unique, general question topics that can be answered by the passage.
+Deconstruct the provided text about Bengal Meat into its core components. All output must be explicitly framed within the context of the company "Bengal Meat."
+1.  **Propositions:** A series of fully disambiguated and self-contained informational chunks about Bengal Meat.
+2.  **Question Patterns:** A list of all unique, general question topics about Bengal Meat that can be answered by the passage.
 3.  **Keywords:** A comprehensive list of exact keywords and phrases from the entire text.
 
-Your entire output must be a single, valid JSON object in pure Bengali.
+Your entire output must be a single, valid JSON object.
 
 ---
 **OUTPUT SCHEMA DEFINITION (Strictly follow this):**
 - **`PassageAnalysis`**: The root object.
   - **`propositions`**: A list of `Proposition` objects.
     - **`Proposition`**:
-      - **`summary`**: `str`. A very brief, self-contained, and specific topic or title for the idea in Bengali.
-      - **`proposition`**: `str`. The text chunk from the source, minimally edited ONLY to resolve ambiguity.
-  - **`question_patterns`**: `List[str]`. A list of general, topic-wise Bengali question patterns answerable by the text.
-  - **`keywords_and_phrases`**: `List[str]`. A single, unique list of exact Bengali keywords and phrases found in the entire text.
+      - **`summary`**: `str`. A very brief, self-contained title for the idea that **must explicitly mention Bengal Meat**.
+      - **`proposition`**: `str`. The text chunk, minimally edited to resolve ambiguity and ground the context in **Bengal Meat**.
+  - **`question_patterns`**: `List[str]`. A list of general, topic-wise question patterns that **explicitly ask about Bengal Meat**.
+  - **`keywords_and_phrases`**: `List[str]`. A single, unique list of exact keywords and phrases (both Bengali and English) found in the entire text.
 
 ---
 **INSTRUCTIONS & RULES:**
 
 **A. For `propositions`:**
-1.  **Context is Key:** Use the `CONTEXTUAL DATA` (e.g., `Service`, `Topic`) to understand the text's subject matter.
-2.  **Logical Grouping:** Combine introductory sentences with their corresponding lists or steps into a single proposition. DO NOT split lists or procedural steps.
-3.  **Self-Containment:** Each `proposition` and its `summary` must be a complete, standalone idea.
-4.  **<<< CRITICAL: DISAMBIGUATION >>>**: You MUST resolve ambiguous references. Replace pronouns (`এই`, `এটি`) and vague phrases (`এই সেবা`) with the specific noun they refer to, using the `CONTEXTUAL DATA`.
-    -   Example: `"আপনি রেজিস্ট্রেশন করে এই ওয়েবসাইটের সুবিধা নিতে পারেন।"` -> `"আপনি রেজিস্ট্রেশন করে বাংলাদেশ নির্বাচন কমিশনের এনআইডি ওয়েবসাইটের সুবিধা নিতে পারেন।"`
+1.  **Context is Key:** Use the `CONTEXTUAL DATA` (i.e., `Topic`) to understand the text's subject matter in relation to Bengal Meat.
+2.  **Logical Grouping:** Combine introductory sentences with their corresponding lists or steps into a single proposition. DO NOT split lists.
+3.  **Self-Containment:** Each `proposition` must be a complete, standalone fact about Bengal Meat.
+4.  **<<< CRITICAL: DISAMBIGUATION & CONTEXTUAL GROUNDING >>>**: You MUST resolve all ambiguities. Replace pronouns (`এই`, `এটি`) and general terms (`আমাদের`, `কোম্পানি`, `এই সাইট`) with the specific entity they refer to, which is always **'Bengal Meat'** or **'Bengal Meat-এর ওয়েবসাইট'**. This is the most important rule to ensure every proposition is a self-contained fact.
+    -   Example 1: `"আমাদের ডেলিভারি সময়..."` -> `"বেঙ্গলমিটের ডেলিভারি সময়..."`
+    -   Example 2: `"এই নীতি অনুযায়ী রিফান্ড করা হবে।"` -> `"বেঙ্গলমিটের রিফান্ড নীতি অনুযায়ী রিফান্ড করা হবে।"`
 5.  **Modified Verbatim Rule:** The `proposition` field must be a near-verbatim copy of the source text. The ONLY permitted modification is the disambiguation described in Rule #4.
-6.  **Specific Summaries:** The `summary` must be a specific, unambiguous title.
-    -   Bad: `"রেজিস্ট্রেশন প্রক্রিয়া"`
-    -   Good: `"এনআইডি ওয়েবসাইট ভোটার রেজিস্ট্রেশন প্রক্রিয়া"`
+6.  **Specific Summaries:** The `summary` must be a specific, unambiguous title that **explicitly includes "Bengal Meat"**.
+    -   Bad: `"ডেলিভারি তথ্য"`
+    -   Good: `"বেঙ্গলমিটের ডেলিভারি সময় ও চার্জ"`
 
 **B. For `question_patterns`:**
-7.  **Generate Patterns, Not Specifics:** Create general question templates that cover all topics in the text. These should be broad enough to represent a user's general intent.
-    -   **Good Pattern:** `"স্মার্ট কার্ডের স্ট্যাটাস চেক করার উপায় কি?"`
-    -   **Bad (Too Specific):** `"আমার এনআইডি নম্বর ১২৩৪৫ দিয়ে স্মার্ট কার্ডের স্ট্যাটাস কিভাবে চেক করবো?"`
-8.  **Completeness:** Every distinct topic or piece of information in the text should have a corresponding question pattern.
+7.  **Generate Patterns, Not Specifics:** Create general question templates. These questions **must explicitly mention "Bengal Meat"** to be self-contained.
+    -   **Good Pattern:** `"বেঙ্গলমিটের ডেলিভারি চার্জ কত?"`
+    -   **Bad (Not self-contained):** `"ডেলিভারি চার্জ কত?"`
+8.  **Completeness:** Every distinct topic in the text should have a corresponding question pattern about Bengal Meat.
 
 **C. For `keywords_and_phrases`:**
-9.  **Passage-Level & Exact:** This list must contain keywords and phrases from the ENTIRE `TEXT TO PROCESS`. It is a single list for the whole passage.
+9.  **Passage-Level & Exact:** This list must contain keywords and phrases exactly as they appear in the ENTIRE `TEXT TO PROCESS`. Do not add "Bengal Meat" to this list unless it is present in the source text.
 10. **Uniqueness:** Do not repeat keywords. The list should be unique.
 
 **D. General Rules:**
-11. **<<< CRITICAL: LANGUAGE PURITY >>>**: The entire content of your JSON output MUST be in the Bengali language. Do not include tokens from any other language.
+11. **LANGUAGE FLEXIBILITY:** The content of your JSON output's values can contain both Bengali and English, as present in the source.
 12. **VALID JSON ONLY:** Your entire output must be a single, complete, and valid JSON object.
 
 ---
@@ -175,57 +176,45 @@ Your entire output must be a single, valid JSON object in pure Bengali.
 **CONTEXTUAL DATA:**
 ```json
 {{
-  "Alternate_names": "এন আই ডি, এনাইডি, ...",
-  "Category": "স্মার্ট কার্ড ও জাতীয়পরিচয়পত্র",
-  "Keyword": "এনআইডি",
-  "Service": "স্মার্ট কার্ড",
-  "Topic": "স্মার্ট কার্ড যেভাবে পাওয়া যাবে"
+  "Topic": "ডেলিভারি (FAQ)"
 }}
 ```
 
 **TEXT TO PROCESS:**
-"জাতীয় পরিচয়পত্রের নিরাপদ ও সহজ ব্যবহারযোগ্যতা নিশ্চিত করতে এতে যুক্ত করা হয়েছে একটি মাইক্রো চিপ, যা মুহূর্তের মধ্যে একজন নাগরিকের পরিচয় প্রদান করে। আর এই মাইক্রোচিপের মধ্যে নাগরিক সম্পর্কিত যাবতীয় তথ্য নিবদ্ধ থাকার কারণে এটিকে বলা হয় স্মার্ট কার্ড। আপনি ভোটার হয়েছেন কিন্তু এখনো স্মার্ট এন আই ডি কার্ড (Smart NID Card) পাননি, তাহলে অপেক্ষা করতে হবে। বাংলাদেশ নির্বাচন কমিশন থেকে মাত্র ১ কোটি ভোটারদের মাঝে স্মার্ট আইডি বিতরণ করা হয়েছে। আপনার স্মার্ট আইডি কার্ড তৈরি হলে ইউনিয়ন পরিষদ বা সিটি কর্পোরেশন থেকে সেটি সংগ্রহ করতে পারবেন।"
+"১. আপনার ডেলিভারির সময় ও চার্জ কত? আমাদের ডেলিভারি সময় সকাল ৯টা থেকে রাত ৯টা পর্যন্ত। ডেলিভারি চার্জ আপনার অবস্থান অনুযায়ী ৬০ টাকা থেকে ১৩০ টাকার মধ্যে পরিবর্তিত হবে। ২. আমি কীভাবে জানব আমার অর্ডার পৌঁছেছে? আপনি আমাদের ওয়েবসাইট ও মোবাইল অ্যাপের মাধ্যমে আপনার অর্ডার ট্র্যাক করতে পারবেন। ডেলিভারি ম্যান আপনার অবস্থানে পৌঁছালে আপনাকে ফোন করে জানাবেন।"
 
 **EXPECTED JSON OUTPUT:**
 ```json
 {{
   "propositions": [
     {{
-      "summary": "স্মার্ট কার্ডের সংজ্ঞা ও মাইক্রো চিপের কার্যকারিতা",
-      "proposition": "জাতীয় পরিচয়পত্রের নিরাপদ ও সহজ ব্যবহারযোগ্যতা নিশ্চিত করতে জাতীয় পরিচয়পত্রে যুক্ত করা হয়েছে একটি মাইক্রো চিপ, যা মুহূর্তের মধ্যে একজন নাগরিকের পরিচয় প্রদান করে। আর এই মাইক্রোচিপের মধ্যে নাগরিক সম্পর্কিত যাবতীয় তথ্য নিবদ্ধ থাকার কারণে জাতীয় পরিচয়পত্রটিকে বলা হয় স্মার্ট কার্ড।"
+      "summary": "বেঙ্গলমিটের ডেলিভারি সময় ও চার্জ",
+      "proposition": "বেঙ্গলমিটের ডেলিভারি সময় সকাল ৯টা থেকে রাত ৯টা পর্যন্ত। ডেলিভারি চার্জ আপনার অবস্থান অনুযায়ী ৬০ টাকা থেকে ১৩০ টাকার মধ্যে পরিবর্তিত হবে।"
     }},
     {{
-      "summary": "স্মার্ট কার্ড না পাওয়ার ক্ষেত্রে করণীয়",
-      "proposition": "আপনি ভোটার হয়েছেন কিন্তু এখনো স্মার্ট এন আই ডি কার্ড (Smart NID Card) পাননি, তাহলে অপেক্ষা করতে হবে।"
-    }},
-    {{
-      "summary": "বাংলাদেশে স্মার্ট কার্ড বিতরণের বর্তমান অবস্থা",
-      "proposition": "বাংলাদেশ নির্বাচন কমিশন থেকে মাত্র ১ কোটি ভোটারদের মাঝে স্মার্ট আইডি বিতরণ করা হয়েছে।"
-    }},
-    {{
-      "summary": "স্মার্ট কার্ড সংগ্রহের নির্ধারিত স্থান",
-      "proposition": "আপনার স্মার্ট আইডি কার্ড তৈরি হলে ইউনিয়ন পরিষদ বা সিটি কর্পোরেশন থেকে স্মার্ট আইডি কার্ডটি সংগ্রহ করতে পারবেন।"
+      "summary": "বেঙ্গলমিট অর্ডারের ডেলিভারি স্ট্যাটাস ট্র্যাকিং",
+      "proposition": "আপনি বেঙ্গলমিটের ওয়েবসাইট ও মোবাইল অ্যাপের মাধ্যমে আপনার অর্ডার ট্র্যাক করতে পারবেন। ডেলিভারি ম্যান আপনার অবস্থানে পৌঁছালে আপনাকে ফোন করে জানাবেন।"
     }}
   ],
   "question_patterns": [
-    "স্মার্ট কার্ড কি এবং কেন এটিকে স্মার্ট কার্ড বলা হয়?",
-    "স্মার্ট কার্ডের মাইক্রো চিপের কাজ কি?",
-    "ভোটার হওয়ার পরেও স্মার্ট কার্ড না পেলে করণীয় কি?",
-    "বাংলাদেশ নির্বাচন কমিশন কতগুলো স্মার্ট কার্ড বিতরণ করেছে?",
-    "তৈরি হওয়া স্মার্ট কার্ড কোথা থেকে সংগ্রহ করতে হয়?"
+    "বেঙ্গলমিটের ডেলিভারি কখন করা হয়?",
+    "বেঙ্গলমিটের ডেলিভারি চার্জ কেমন?",
+    "বেঙ্গলমিটের অর্ডার কিভাবে ট্র্যাক করতে হয়?",
+    "আমার বেঙ্গলমিট অর্ডার ডেলিভারি হয়েছে কিনা তা কিভাবে বুঝবো?"
   ],
   "keywords_and_phrases": [
-    "জাতীয় পরিচয়পত্র",
-    "মাইক্রো চিপ",
-    "নাগরিকের পরিচয়",
-    "স্মার্ট কার্ড",
-    "ভোটার",
-    "স্মার্ট এন আই ডি কার্ড",
-    "Smart NID Card",
-    "বাংলাদেশ নির্বাচন কমিশন",
-    "স্মার্ট আইডি বিতরণ",
-    "ইউনিয়ন পরিষদ",
-    "সিটি কর্পোরেশন"
+    "ডেলিভারি",
+    "ডেলিভারি সময়",
+    "ডেলিভারি চার্জ",
+    "সকাল ৯টা",
+    "রাত ৯টা",
+    "৬০ টাকা",
+    "১৩০ টাকা",
+    "অর্ডার",
+    "আমাদের ওয়েবসাইট",
+    "মোবাইল অ্যাপ",
+    "অর্ডার ট্র্যাক",
+    "ডেলিভারি ম্যান"
   ]
 }}
 ```

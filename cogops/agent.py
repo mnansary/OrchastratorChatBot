@@ -7,17 +7,17 @@ import asyncio
 import logging
 from typing import AsyncGenerator, Dict, Any, List, Tuple
 
-from dotenv import load_dotenv
-load_dotenv()
-
 # --- Exception Imports for Network Errors ---
 from openai import APIConnectionError, APITimeoutError
 from requests.exceptions import RequestException
 
 # --- Core Component Imports ---
-from cogops.prompt import get_agent_prompt
+# We now import the AGENT_PROMPT template directly, as the TokenManager will handle formatting.
+from cogops.prompt import AGENT_PROMPT
 from cogops.tools.tools import tools_list, available_tools_map
 from cogops.models.qwen3async_llm import AsyncLLMService
+from cogops.tools.private.user_tools import generate_full_user_context_markdown
+# NEW: Import the TokenManager, which is now essential for safe prompt construction.
 from cogops.utils.token_manager import TokenManager
 
 # --- Setup Logging ---
@@ -26,15 +26,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class ChatAgent:
     """
     An end-to-end conversational agent that uses a tool-based pipeline.
-    This agent is session-aware and holds user metadata for contextual tool calls.
+    This agent is session-aware and holds user metadata and context strings.
     """
-    def __init__(self, config_path: str, session_meta: Dict[str, Any]):
+    def __init__(self, config_path: str, session_meta: Dict[str, Any], location_context: str, store_catalog: str):
         """
         Initializes the ChatAgent for a specific user session.
 
         Args:
             config_path: Path to the main configuration YAML file.
             session_meta: A dictionary containing session-specific data like store_id and user_id.
+            location_context: A pre-generated Markdown string with all location/delivery info.
+            store_catalog: A pre-generated Markdown string with the store's product catalog.
         """
         logging.info(f"Initializing ChatAgent with session_meta: {session_meta}")
         self.config = self._load_config(config_path)
@@ -44,20 +46,26 @@ class ChatAgent:
         self.agent_name = self.config.get('agent_name', 'Bengal Meat Assistant')
         self.agent_story = self.config.get('agent_story', 'I am a helpful AI assistant from Bengal Meat.')
 
-        # --- User Context Storage ---
-        # This dictionary will be populated with data from private tools for logged-in users.
-        self.user_context: Dict[str, Any] = {}
+        # --- Context Storage ---
+        # User-specific context (profile, orders) - loaded by _enrich_context for logged-in users.
+        self.user_context: str = "# User Context\n\n*This is a guest user session.*"
+        # Static, global context passed in from the ContextManager.
+        self.location_context: str = location_context
+        self.store_catalog: str = store_catalog
 
-        # --- Initialize LLM Service ---
+        # --- Initialize LLM and Tokenizer ---
         self.llm_service = self._initialize_llm_service()
-
-        # --- Initialize Tokenizer ---
-        # The tokenizer uses the same model as the LLM service for accurate counting.
-        logging.info(f"Initializing TokenManager with model: {self.llm_service.model}")
+        
+        # CORRECTED: Initialize and use the TokenManager for safe prompt building.
+        tm_config = self.config['token_management']
+        tokenizer_model = os.getenv(tm_config['tokenizer_model_name_env'])
+        if not tokenizer_model:
+            raise ValueError(f"Missing environment variable for tokenizer: {tm_config['tokenizer_model_name_env']}")
+        
         self.token_manager = TokenManager(
-            model_name=self.llm_service.model,
-            reservation_tokens=0,
-            history_budget=1.0
+            model_name=tokenizer_model,
+            reservation_tokens=tm_config['prompt_template_reservation_tokens'],
+            history_budget=tm_config['history_truncation_budget']
         )
 
         # --- Conversation and Tool Management ---
@@ -70,46 +78,33 @@ class ChatAgent:
         self.tool_functions = available_tools_map
         self.tools_description = json.dumps(self.tools_schema, indent=4)
 
-        logging.info("✅ ChatAgent object created. Context enrichment pending.")
+        logging.info("✅ ChatAgent object created. User-specific context enrichment pending.")
 
     async def _enrich_context(self):
         """
-        Autonomously calls private tools at the start of a session for a logged-in user
-        to gather context (profile, order history, etc.). This method is called by the API service
-        immediately after the agent is instantiated.
+        For logged-in users, calls the master context generation function to build
+        a single Markdown string containing their profile and order history.
         """
         if not self.session_meta.get('user_id'):
-            logging.info("Guest user session. Skipping context enrichment.")
+            logging.info("Guest user session. Skipping user-specific context enrichment.")
             return
 
-        logging.info(f"Registered user detected (ID: {self.session_meta['user_id']}). Starting context enrichment...")
+        logging.info(f"Registered user detected (ID: {self.session_meta['user_id']}). Enriching user context...")
         
-        # --- CORRECTED SECTION ---
-        # Instead of calling the functions directly, we wrap them in asyncio.to_thread()
-        # to create awaitable tasks that run the blocking code in a separate thread.
-        tasks = [
-            asyncio.to_thread(self.tool_functions["fetch_user_profile"], self.session_meta),
-            asyncio.to_thread(self.tool_functions["fetch_user_order_history"], self.session_meta),
-            asyncio.to_thread(self.tool_functions["fetch_user_loyalty_status"], self.session_meta)
-        ]
-        # --- END OF CORRECTION ---
-
-        # Run all tasks in parallel and get results, allowing for individual failures
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Unpack results safely, checking for exceptions before assigning to context
-        profile, history, loyalty = results
-
-        if not isinstance(profile, Exception) and profile:
-            self.user_context["profile"] = profile
-        if not isinstance(history, Exception) and history:
-            self.user_context["order_history"] = history
-        if not isinstance(loyalty, Exception) and loyalty:
-            self.user_context["loyalty"] = loyalty
-        
-        logging.info(f"Context enrichment complete. Context gathered: {list(self.user_context.keys())}")
+        try:
+            # Run the blocking network calls in a separate thread to not block the event loop
+            context_string = await asyncio.to_thread(
+                generate_full_user_context_markdown, 
+                self.session_meta
+            )
+            self.user_context = context_string
+            logging.info("User context enrichment complete.")
+        except Exception as e:
+            logging.error(f"Failed to enrich user context for user {self.session_meta['user_id']}: {e}", exc_info=True)
+            self.user_context = "# User Context\n\n*Error: Could not retrieve user profile and order data.*"
 
     def _load_config(self, config_path: str) -> Dict:
+        """Loads the agent's YAML configuration file."""
         logging.info(f"Loading configuration from: {config_path}")
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -119,6 +114,7 @@ class ChatAgent:
             raise
     
     def _initialize_llm_service(self) -> AsyncLLMService:
+        """Initializes the asynchronous LLM service client from configuration."""
         logging.info("Initializing primary LLM service...")
         cfg = self.config['llm_service']
         api_key = os.getenv(cfg['api_key_env'])
@@ -127,49 +123,54 @@ class ChatAgent:
         max_tokens = cfg.get('max_context_tokens', 32000)
         
         if not all([api_key, model, url]):
-            raise ValueError(f"Missing environment variables for LLM service '{cfg['name']}'")
+            raise ValueError(f"Missing one or more environment variables for LLM service: Check {cfg['api_key_env']}, {cfg['model_name_env']}, and {cfg['base_url_env']}")
             
         return AsyncLLMService(api_key, model, url, max_tokens)
 
     def _format_conversation_history(self) -> str:
+        """Formats the stored conversation history into a string for the prompt."""
         if not self.history:
             return "No conversation history yet."
-        return "\n---\n".join([f"User: {u}\nAI: {a}" for u, a in self.history])
+        return "\n---\n".join([f"User: {u}\nAssistant: {a}" for u, a in self.history])
 
     async def generate_welcome_message(self) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Generates a welcome message that is personalized if user context (e.g., name) was successfully fetched.
+        Generates a welcome message that acknowledges if the user is logged in.
         """
         logging.info("Generating welcome message for the session.")
-        user_name = self.user_context.get("profile", {}).get("name")
-
-        if user_name:
-            # Personalized welcome for registered users
-            welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম, {user_name}! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
+        
+        if self.session_meta.get('user_id'):
+            # Acknowledges a returning/logged-in user
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে আবার স্বাগতম! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
         else:
-            # Templated welcome for guest users (or if profile fetch failed)
+            # Standard welcome for guest users
             welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম! আমি {self.agent_name}। আমি আপনাকে আমাদের পণ্য, অফার এবং স্টোর খুঁজে পেতে সাহায্য করতে পারি। বলুন, কীভাবে শুরু করতে পারি?"
 
         yield {"type": "welcome_message", "content": welcome_text}
         
     async def process_query(self, user_query: str) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Processes a user's query by constructing a detailed prompt with all available context
+        Processes a user's query by constructing a detailed, token-safe prompt
         and orchestrating LLM and tool calls.
         """
         logging.info(f"\n--- Processing Query: '{user_query}' for store_id: {self.session_meta.get('store_id')} ---")
         
         try:
-            conversation_history_str = self._format_conversation_history()
-
-            master_prompt = get_agent_prompt(
+            # CRITICAL FIX: Use the TokenManager to build a context-aware and safe prompt.
+            # This prevents context overflow errors by truncating history/context if needed.
+            master_prompt = self.token_manager.build_safe_prompt(
+                template=AGENT_PROMPT,
+                max_tokens=self.llm_service.max_context_tokens,
+                # Pass all components to the builder. The manager handles formatting.
                 agent_name=self.agent_name,
                 agent_story=self.agent_story,
                 tools_description=self.tools_description,
-                conversation_history=conversation_history_str,
+                history=self.history, # Pass the raw list of tuples
                 user_query=user_query,
-                session_meta=self.session_meta,
-                user_context=self.user_context  # Pass the enriched context to the prompt
+                session_meta=json.dumps(self.session_meta, indent=2),
+                user_context=self.user_context,
+                location_context=self.location_context,
+                store_catalog=self.store_catalog
             )
             
             messages = [
@@ -178,16 +179,21 @@ class ChatAgent:
             ]
 
             full_final_answer = []
+            # The stream_with_tool_calls function now handles yielding structured events.
             stream_generator = self.llm_service.stream_with_tool_calls(
                 messages=messages,
                 tools=self.tools_schema,
                 available_tools=self.tool_functions,
+                session_meta=self.session_meta, # Pass session_meta for private tool calls
                 **self.llm_call_params
             )
 
-            async for chunk in stream_generator:
-                full_final_answer.append(chunk)
-                yield {"type": "answer_chunk", "content": chunk}
+            async for event in stream_generator:
+                # Collect content from 'answer_chunk' events to build the full response for history.
+                if event.get("type") == "answer_chunk":
+                    full_final_answer.append(event.get("content", ""))
+                # Stream the entire event (tool_call or chunk) directly to the frontend.
+                yield event
 
             final_answer_str = "".join(full_final_answer).strip()
 

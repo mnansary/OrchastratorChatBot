@@ -5,7 +5,8 @@ import requests
 import logging
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-
+from datetime import datetime
+from cogops.utils.private_api import make_private_request as _make_private_request
 load_dotenv()
 
 # --- Configuration ---
@@ -15,99 +16,100 @@ if not BASE_URL:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-# --- SIMPLIFIED HELPER FUNCTION ---
-def _make_private_request(endpoint: str, session_meta: Dict[str, Any], method: str = 'GET', payload: Optional[Dict] = None) -> Optional[Dict]:
-    """Handles authenticated requests by sending both access and refresh tokens in the headers."""
-    access_token = session_meta.get('access_token')
-    refresh_token = session_meta.get('refresh_token')
-
-    if not all([access_token, refresh_token]):
-        logging.error(f"Missing access_token or refresh_token for a private API call to {endpoint}.")
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "refreshToken": refresh_token,
-        "Content-Type": "application/json"
-    }
-    api_url = f"{BASE_URL}/{endpoint}"
-    
+# --- Helper to format dates cleanly ---
+def _format_date(date_string: Optional[str]) -> str:
+    if not date_string:
+        return "N/A"
     try:
-        if method == 'GET':
-            response = requests.get(api_url, headers=headers, timeout=15)
-        elif method == 'POST':
-            response = requests.post(api_url, headers=headers, json=payload, timeout=15)
-        else:
-            logging.error(f"Unsupported HTTP method: {method}")
-            return None
-            
-        response.raise_for_status()
-        return response.json()
+        return datetime.fromisoformat(date_string.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+    except (ValueError, TypeError):
+        return date_string
+
+# --- NEW MASTER TOOL FUNCTION ---
+
+def get_user_order_profile_as_markdown(session_meta: Dict[str, Any], order_code: Optional[str] = None) -> str:
+    """
+    Fetches a user's order history and/or the details of a specific order,
+    then formats the output into a comprehensive and token-efficient Markdown string.
+
+    - If 'order_code' is provided, it fetches details for that specific order.
+    - If 'order_code' is omitted, it fetches a summary of the user's 3 most recent orders.
+    """
+    user_id = session_meta.get('user_id')
+    if not user_id:
+        return "Error: Cannot fetch order profile without a user session."
+
+    # --- Step 1: Always fetch the recent order history first ---
+    history_endpoint = "order-btoc/orderHistoryOrderData/0"
+    history_response = _make_private_request(history_endpoint, session_meta)
+
+    if not history_response or not history_response.get('data'):
+        return "# User Order Profile\n\nNo order history found for this user."
+
+    order_history = history_response['data']
+
+    # --- Scenario A: User asked for a SPECIFIC order ---
+    if order_code:
+        target_order_summary = next((order for order in order_history if order.get("order_code") == order_code), None)
+        if not target_order_summary:
+            return f"# Order Not Found\n\nCould not find an order with the code `{order_code}` in the user's recent history."
+
+        order_id = target_order_summary.get('id')
+        return _fetch_and_format_single_order(order_id, session_meta)
+
+    # --- Scenario B: User asked for a GENERAL history or for recommendations ---
+    else:
+        markdown_lines = ["# User Order Profile", "A summary of the user's most recent purchasing behavior."]
         
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error for {endpoint}: {http_err} - {http_err.response.text}")
-        return None
-    except requests.exceptions.RequestException as req_err:
-        logging.error(f"Request failed for {endpoint}: {req_err}")
-        return None
+        # Limit to the 3 most recent orders to avoid being too slow or verbose
+        for order_summary in order_history[:3]:
+            order_id = order_summary.get('id')
+            if order_id:
+                # Fetch details for each order to get the product list
+                details_md = _fetch_and_format_single_order(order_id, session_meta, summary_mode=True)
+                markdown_lines.append("\n---\n" + details_md)
+        
+        return "\n".join(markdown_lines)
 
 
-def fetch_user_order_history(session_meta: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """Fetches the user's past order history for the agent's internal context."""
-    user_id = session_meta.get('user_id')
-    if not user_id:
-        logging.warning("fetch_user_order_history: Attempted to call without user_id. Skipping.")
-        return None
-
-    endpoint = "order-btoc/orderHistoryOrderData/0"
-    logging.info(f"Fetching order history for user_id: {user_id}")
-    data = _make_private_request(endpoint, session_meta)
-    
-    if data and 'data' in data:
-        orders = data['data']
-        simplified_history = [
-            {
-                "order_id": order.get("id"), "order_code": order.get("order_code"),
-                "order_date": order.get("order_at"), "total_amount": order.get("grand_total"),
-                "status": order.get("status")
-            }
-            for order in orders[:5]
-        ]
-        logging.info(f"Successfully fetched {len(simplified_history)} recent orders for user_id: {user_id}")
-        return simplified_history
-
-    logging.warning(f"Failed to fetch or parse order history for user_id: {user_id}")
-    return None
-
-
-def fetch_order_contents(order_id: int, session_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Fetches the specific products that were part of a single past order."""
-    user_id = session_meta.get('user_id')
-    if not user_id:
-        logging.warning("fetch_order_contents: Attempted to call without user_id. Skipping.")
-        return None
-
+def _fetch_and_format_single_order(order_id: int, session_meta: Dict[str, Any], summary_mode: bool = False) -> str:
+    """Internal helper to fetch and format one order's details into Markdown."""
     endpoint = f"order-btoc/orderProductListFromOrderId/{order_id}"
-    logging.info(f"Fetching contents for order_id: {order_id}")
     data = _make_private_request(endpoint, session_meta)
-    
-    if data and data.get('data', {}).get('orderInfo') and data.get('data', {}).get('baseProductData'):
-        order_info = data['data']['orderInfo']
-        products = data['data']['baseProductData']
+
+    if not data or not data.get('data'):
+        return f"### Order ID: {order_id}\n- Error: Could not retrieve details for this order."
+
+    order_info = data['data'].get('orderInfo', {})
+    products = data['data'].get('baseProductData', [])
+
+    if not order_info:
+        return f"### Order ID: {order_id}\n- Error: Missing order summary information."
         
-        order_details = {
-            "order_summary": {
-                "order_code": order_info.get("order_code"), "order_date": order_info.get("order_at"),
-                "status": order_info.get("status"), "total_amount": order_info.get("grand_total")
-            },
-            "products_in_order": [
-                {"name": prod.get("product_name"), "quantity": prod.get("quantity"), "price_per_unit": prod.get("rate")}
-                for prod in products
-            ]
-        }
-        logging.info(f"Successfully fetched {len(products)} items for order_id: {order_id}")
-        return order_details
+    order_code = order_info.get('order_code', 'N/A')
+    order_date = _format_date(order_info.get('order_at'))
+    status = order_info.get('status', 'N/A')
+
+    # In summary mode, we use a more compact format
+    if summary_mode:
+        lines = [f"### Order `{order_code}` (Placed on: {order_date})"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Total:** {order_info.get('grand_total', 'N/A')} BDT")
+    else: # Full detail mode
+        lines = [f"# Details for Order `{order_code}`"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Order Date:** {order_date}")
+        lines.append(f"- **Payment Method:** {order_info.get('online_payment_method', 'N/A')}")
+        lines.append(f"- **Delivery Address:** {order_info.get('delivery_address_text', 'N/A')}")
+        lines.append(f"- **Subtotal:** {order_info.get('total', 'N/A')} BDT")
+        lines.append(f"- **Delivery Fee:** {order_info.get('delivery_charge', 'N/A')} BDT")
+        lines.append(f"- **Grand Total:** {order_info.get('grand_total', 'N/A')} BDT")
+
+    if products:
+        lines.append("- **Items in Order:**")
+        for prod in products:
+            lines.append(f"  - {prod.get('product_name', 'N/A')} (Qty: {prod.get('quantity', 0)})")
+    else:
+        lines.append("- No product information available for this order.")
         
-    logging.warning(f"Failed to fetch or parse contents for order_id: {order_id}")
-    return None
+    return "\n".join(lines)

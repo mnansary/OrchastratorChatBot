@@ -1,0 +1,3079 @@
+================================================================================
+--- File: api_service.py ---
+================================================================================
+
+# FILE: api_service.py
+
+import asyncio
+import json
+import uvicorn
+import uuid
+import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+
+# Core application components
+from cogops.agent import ChatAgent
+from fastapi.middleware.cors import CORSMiddleware
+# NEW: Import the context manager to handle static data loading
+from cogops.context_manager import context_manager
+
+# --- Global Configuration ---
+AGENT_CONFIG_PATH = "configs/config.yaml"
+# Define a default store/customer for the initial context build at startup
+DEFAULT_STORE_ID = 37 # e.g., Mohammadpur store is a good default
+GUEST_CUSTOMER_ID = "369"
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- API Setup ---
+app = FastAPI(
+    title="Bengal Meat Chat Agent API",
+    description="A session-based API for the Bengal Meat Chat Agent service.",
+    version="3.0.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Session Management ---
+# This dictionary maps a unique session_id (UUID) to a ChatAgent instance.
+chat_sessions: Dict[str, ChatAgent] = {}
+sessions_lock = asyncio.Lock()
+
+# --- NEW: Add a startup event handler ---
+@app.on_event("startup")
+async def startup_event():
+    """
+    On application startup, this function builds the static context (locations, catalog)
+    that will be shared across all user sessions. This is done only once to improve performance.
+    """
+    logging.info("Application startup: Building static context...")
+    # The context_manager will call the necessary APIs and store the results in memory.
+    context_manager.build_static_context(store_id=DEFAULT_STORE_ID, customer_id=GUEST_CUSTOMER_ID)
+    logging.info("Application is ready to accept requests.")
+
+
+# --- Pydantic Models for Requests ---
+class ChatRequest(BaseModel):
+    session_meta: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    query: Optional[str] = None # Query is optional only for the very first call
+
+class ClearSessionRequest(BaseModel):
+    session_id: str
+
+
+# --- API Endpoints ---
+@app.get("/health", tags=["Monitoring"])
+async def health_check():
+    """Confirms the service is running and reports the number of active sessions."""
+    return {"status": "ok", "active_sessions": len(chat_sessions)}
+
+
+@app.post("/chat/clear_session", tags=["Session Management"])
+async def clear_session(request: ClearSessionRequest):
+    """Clears conversation history by deleting a specific session instance."""
+    session_id = request.session_id
+    
+    async with sessions_lock:
+        if session_id in chat_sessions:
+            del chat_sessions[session_id]
+            message = f"Session '{session_id}' has been cleared."
+            logging.info(f"-> Cleared session for session_id: {session_id}")
+        else:
+            message = f"No active session found for session_id '{session_id}'."
+            logging.warning(f"-> Attempted to clear non-existent session for session_id: {session_id}")
+            
+    return {"status": "success", "message": message}
+
+
+@app.post("/chat/stream", tags=["Chat"])
+async def stream_chat(chat_request: ChatRequest):
+    """
+    Main chat endpoint with session management.
+    - On the first call, expects 'session_meta'. Creates a session, returns a 'session_id', and a welcome message.
+    - On subsequent calls, expects 'session_id' and a 'query' to continue the conversation.
+    """
+    async def response_generator():
+        # --- Case 1: Initial Request (Create New Session) ---
+        if chat_request.session_meta and not chat_request.session_id:
+            if 'store_id' not in chat_request.session_meta:
+                error_event = {"type": "error", "content": "FATAL: store_id is missing from session_meta."}
+                yield f'{json.dumps(error_event)}\n'
+                logging.error("API call failed: store_id missing from session_meta on initial request.")
+                return
+
+            new_session_id = str(uuid.uuid4())
+            logging.info(f"-> Creating new session {new_session_id} with meta: {chat_request.session_meta}")
+            
+            async with sessions_lock:
+                # Instantiate the agent, passing the pre-built static context from the manager.
+                session = ChatAgent(
+                    config_path=AGENT_CONFIG_PATH,
+                    session_meta=chat_request.session_meta,
+                    location_context=context_manager.location_context,
+                    store_catalog=context_manager.store_catalog
+                )
+                chat_sessions[new_session_id] = session
+            
+            # Autonomously fetch user-specific context (profile, orders) if logged in.
+            await session._enrich_context()
+
+            # The VERY FIRST message must be the new session_id for the frontend.
+            yield f'{json.dumps({"type": "session_id", "id": new_session_id})}\n'
+            
+            # Now, stream the (potentially personalized) welcome message.
+            async for event in session.generate_welcome_message():
+                yield f"{json.dumps(event, ensure_ascii=False)}\n"
+            return # End the stream after the welcome message
+
+        # --- Case 2: Subsequent Request (Continue Existing Session) ---
+        elif chat_request.session_id:
+            if not chat_request.query:
+                error_event = {"type": "error", "content": "Query is missing for an existing session."}
+                yield f'{json.dumps(error_event)}\n'
+                logging.warning(f"Invalid request for session {chat_request.session_id}: Query was missing.")
+                return
+
+            async with sessions_lock:
+                session = chat_sessions.get(chat_request.session_id)
+
+            if not session:
+                error_event = {"type": "error", "content": f"Invalid or expired session_id: {chat_request.session_id}"}
+                yield f'{json.dumps(error_event)}\n'
+                logging.error(f"Request failed for invalid session_id: {chat_request.session_id}")
+                return
+            
+            # Process the user's query and stream the response.
+            async for event in session.process_query(chat_request.query):
+                yield f"{json.dumps(event, ensure_ascii=False)}\n"
+        
+        # --- Case 3: Invalid Request ---
+        else:
+            error_event = {"type": "error", "content": "Invalid request. Provide either session_meta (for new session) or session_id (for existing session)."}
+            yield f'{json.dumps(error_event)}\n'
+            logging.error("Invalid request structure received at /chat/stream.")
+    
+    return StreamingResponse(response_generator(), media_type="application/x-ndjson")
+
+
+if __name__ == "__main__":
+    # To run this service, execute the command in your terminal from the project root:
+    # uvicorn api_service:app --host 0.0.0.0 --port 9000 --reload
+    print("Starting Uvicorn server on http://0.0.0.0:9000")
+    uvicorn.run("api_service:app", host="0.0.0.0", port=9000, reload=True)
+
+================================================================================
+--- File: app.py ---
+================================================================================
+
+# FILE: streamlit_app.py
+
+import streamlit as st
+import requests
+import json
+import time
+
+# --- Configuration ---
+API_BASE_URL = "http://localhost:9000"
+CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
+LOGIN_API_URL = "https://api.bengalmeat.com/auth/customer-login"
+
+# --- Page Setup ---
+st.set_page_config(
+    page_title="Bengal Meat Assistant",
+    page_icon="🥩",
+    layout="centered"
+)
+
+# --- Helper Functions ---
+
+@st.cache_data(ttl=3600)
+def fetch_stores() -> dict:
+    """Fetches store locations from the public company API."""
+    try:
+        response = requests.get("https://api.bengalmeat.com/store/storelistopen/1?is_visible=1")
+        response.raise_for_status()
+        stores = response.json().get('data', [])
+        # Filter out any test stores
+        return {
+            f"{store['name']} ({store.get('CITY', 'N/A')})": store['id'] 
+            for store in stores if "test" not in store.get("name", "").lower()
+        }
+    except Exception as e:
+        st.error(f"Could not fetch store list. Using fallback. Error: {e}")
+        return {"Mohammadpur Butcher Shop": 37, "Gulshan-2 GB": 67} # Sensible fallback
+
+def reset_session():
+    """Clears the session state to start a new chat."""
+    keys_to_clear = [key for key in st.session_state.keys() if key != 'stores']
+    for key in keys_to_clear:
+        del st.session_state[key]
+    # Re-initialize essential state
+    st.session_state.stage = "setup"
+    st.session_state.messages = []
+    st.session_state.session_id = None
+    st.rerun()
+
+# --- UI Sections ---
+
+def render_setup_page():
+    """Renders the initial screen for store selection and login."""
+    st.image("https://bengalmeat.com/wp-content/uploads/2023/11/logo.png", width=200)
+    st.title("Welcome to Bengal Meat's Chat Assistant!")
+    st.markdown("Please select your nearest store and log in to begin.")
+
+    if 'stores' not in st.session_state:
+        st.session_state.stores = fetch_stores()
+
+    selected_store_name = st.selectbox(
+        "Choose your store",
+        options=list(st.session_state.stores.keys()),
+        key="selected_store_name"
+    )
+    
+    login_tab, guest_tab = st.tabs(["Login", "Continue as Guest"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            login_button = st.form_submit_button("Login and Start Chat")
+
+            if login_button:
+                store_id = st.session_state.stores[selected_store_name]
+                with st.spinner("Logging in and preparing your personalized session..."):
+                    try:
+                        response = requests.post(LOGIN_API_URL, json={"email": email, "password": password})
+                        response.raise_for_status()
+                        login_data = response.json()
+                        
+                        # Use .get() for safer dictionary access
+                        if login_data.get("statusCode") == 201 and login_data.get("data"):
+                            user_data = login_data["data"].get("user", {})
+                            st.session_state.session_meta = {
+                                "store_id": store_id,
+                                "user_id": user_data.get("id"),
+                                "access_token": login_data["data"].get("accessToken"),
+                                "refresh_token": login_data["data"].get("refreshToken"),
+                            }
+                            st.session_state.stage = 'chat'
+                            st.rerun() # --- CHANGE: Automatically transition to chat ---
+                        else:
+                            st.error(f"Login failed: {login_data.get('message', 'Unknown error')}")
+                    except requests.RequestException as e:
+                        st.error(f"Login connection failed. Please check the server. Error: {e}")
+
+    with guest_tab:
+        if st.button("Continue as Guest and Start Chat"):
+            store_id = st.session_state.stores[selected_store_name]
+            st.session_state.session_meta = {
+                "store_id": store_id,
+                "user_id": None, "access_token": None, "refresh_token": None
+            }
+            st.session_state.stage = 'chat'
+            st.rerun() # --- CHANGE: Automatically transition to chat ---
+
+def render_chat_page():
+    """Renders the main chat interface and handles API communication."""
+    st.title("🥩 Chat with Meaty")
+    st.button("End Session & Start Over", on_click=reset_session)
+    st.markdown("---")
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Handle chat input from the user
+    if prompt := st.chat_input("Ask about products, offers, or your orders..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Prepare request payload for an existing session
+        payload = {"query": prompt, "session_id": st.session_state.session_id}
+        
+        # Display streaming response
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            tool_call_in_progress = False
+            
+            try:
+                with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if line:
+                            event = json.loads(line.decode('utf-8'))
+                            
+                            # --- CHANGE: Handle different event types from the backend ---
+                            event_type = event.get("type")
+                            
+                            if event_type == "tool_call":
+                                tool_name = event.get("tool_name", "a tool")
+                                placeholder.markdown(f"*(Searching for information using {tool_name}...)*")
+                                tool_call_in_progress = True
+                                
+                            elif event_type == "answer_chunk":
+                                if tool_call_in_progress:
+                                    # Clear the "thinking" message when the first text chunk arrives
+                                    full_response = ""
+                                    tool_call_in_progress = False
+                                
+                                full_response += event["content"]
+                                placeholder.markdown(full_response + "▌")
+                                
+                            elif event_type == "error":
+                                st.error(event.get('content', 'An unknown error occurred.'))
+                                break
+                
+                placeholder.markdown(full_response)
+            except requests.RequestException as e:
+                st.error(f"Failed to get response from chat service: {e}")
+                full_response = "Sorry, I'm having trouble connecting right now."
+            
+            if full_response:
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+    # Initial session setup and welcome message
+    if not st.session_state.get("session_id"):
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            with st.spinner("Meaty is preparing your session..."):
+                try:
+                    payload = {"session_meta": st.session_state.session_meta}
+                    with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                        r.raise_for_status()
+                        for line in r.iter_lines():
+                            if line:
+                                event = json.loads(line.decode('utf-8'))
+                                if event["type"] == "session_id":
+                                    st.session_state.session_id = event["id"]
+                                elif event["type"] == "welcome_message":
+                                    full_response += event["content"]
+                                    placeholder.markdown(full_response + "▌")
+                                elif event["type"] == "error":
+                                     st.error(event['content'])
+                                     break
+                    placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except requests.RequestException as e:
+                    st.error(f"Could not initialize chat session: {e}")
+
+
+# --- Main Application Logic ---
+if "stage" not in st.session_state:
+    st.session_state.stage = "setup"
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+
+if st.session_state.stage == "setup":
+    render_setup_page()
+else:
+    render_chat_page()
+
+================================================================================
+--- File: .env ---
+================================================================================
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_EMBEDDER_URL="http://localhost:6000/"
+
+# --- vLLM OpenAI-Compatible Endpoint ---
+VLLM_BASE_URL="http://localhost:5000/v1/"
+VLLM_API_KEY="YOUR_VLLM_API_KEY"
+VLLM_MODEL_NAME="cpatonn/Qwen3-VL-30B-A3B-Instruct-AWQ-8bit"
+
+# --- chroma ------
+CHROMA_DB_HOST="localhost"
+CHROMA_DB_PORT="8443"
+
+# --- postgres ------
+POSTGRES_HOST= "localhost"
+POSTGRES_PORT= "5432"
+POSTGRES_USER= "postgres"
+POSTGRES_PASSWORD= "o+iLHv2VzpHcVY0s1yalhX5yxGjoozVUPaBf71KUnHE="
+POSTGRES_DB= "bengalmeat_fixed"
+
+# --- configs -----
+CONFIG_FILE_PATH="/home/ansary/cliens/bengalmeat/OrchastratorChatBot/configs/config.yaml"
+COMPANY_API_BASE_URL="https://api.bengalmeat.com"
+
+================================================================================
+--- File: configs/config.yaml ---
+================================================================================
+
+# ===================================================================
+# Tool-Based Chat Agent Master Configuration
+# ===================================================================
+# This configuration is designed for an agent that uses a single powerful
+# LLM to orchestrate calls to a predefined set of tools.
+
+agent_name: "meaty"
+agent_story: "বেঙ্গল মিট-এর পক্ষ থেকে আপনার ব্যক্তিগত সহকারী। নিরাপদ ও স্বাস্থ্যকর মাংস খুঁজে পেতে, সেরা অফারগুলো জানতে এবং আপনার যেকোনো প্রশ্নের উত্তর দিতে আমি এখানে আছি। আসুন, আপনার প্রয়োজন অনুযায়ী সেরা পণ্যটি বেছে নিতে আমি আপনাকে সাহায্য করি।"
+
+# --- Primary LLM Service Definition ---
+# The single, orchestrating LLM that will handle reasoning and tool calls.
+llm_service:
+  name: "primary_llm"
+  api_key_env: "VLLM_API_KEY"
+  model_name_env: "VLLM_MODEL_NAME"
+  base_url_env: "VLLM_BASE_URL"
+  max_context_tokens: 32000 # Max context window for the model.
+
+# --- Conversation Management ---
+conversation:
+  history_window: 10  # Number of past user/AI exchanges to retain in memory.
+
+# --- Vector Retriever Configuration (for the 'retrieve_knowledge' tool) ---
+vector_retriever:
+  top_k: 10 # Number of initial candidates to retrieve from each ChromaDB collection.
+  collections:
+    - "PropositionsDB"
+    - "SummariesDB"
+    - "QuestionsDB"
+  max_passages_to_select: 3 # Final number of passages to return after RRF fusion.
+  # Reciprocal Rank Fusion (RRF) constant. A standard value is 60.
+  # Lower values prioritize top-ranked items more heavily.
+  rrf_k: 60
+  # The key in the vector metadata that stores the unique passage identifier.
+  passage_id_meta_key: "passage_id"
+
+# --- Token Management for Prompt Construction ---
+# Manages how the final prompt is built to avoid exceeding the context limit.
+token_management:
+  # The model name (from an environment variable) to use for tokenization.
+  # This should match the primary LLM to ensure accurate token counting.
+  tokenizer_model_name_env: "VLLM_MODEL_NAME"
+  # A fixed number of tokens reserved for the master system prompt's instructions,
+  # ensuring that dynamic content (like history) doesn't push it out of context.
+  prompt_template_reservation_tokens: 1024
+  # The percentage of the remaining token budget to allocate for conversation history.
+  # Here, 40% of the available space (after reserving for the template and query)
+  # will be used for history. The rest is for tool results.
+  history_truncation_budget: 0.4
+
+# --- LLM Call Parameters ---
+# Default generation parameters for the primary LLM's final response, after
+# it has received the results from any tool calls.
+llm_call_parameters:
+  temperature: 0.1
+  max_tokens: 2048 # Max tokens for the final generated answer.
+
+# --- Response Templates ---
+# Standardized text for specific scenarios handled by the agent's logic.
+response_templates:
+  error_fallback: "একটি প্রযুক্তিগত ত্রুটির কারণে আমি এই মুহূর্তে সাহায্য করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
+  tool_failure: "একটি প্রযুক্তিগত সমস্যার কারণে আমি এই মুহূর্তে তথ্য যাচাই করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
+  no_passages_found: "দুঃখিত, আমি আপনার অনুরোধ সম্পর্কিত কোনো তথ্য আমার জ্ঞানভান্ডারে খুঁজে পাচ্ছি না।"
+
+================================================================================
+--- File: cogops/context_manager.py ---
+================================================================================
+
+# FILE: cogops/context_manager.py (New File)
+
+import logging
+from cogops.tools.public.product_tools import get_product_catalog_as_markdown
+from cogops.tools.public.location_tools import generate_location_and_delivery_markdown
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ContextManager:
+    """
+    A singleton-like class to generate and hold global, static context strings
+    that are expensive to create and rarely change (e.g., on server restart).
+    """
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        # This ensures only one instance of ContextManager ever exists.
+        if not cls._instance:
+            cls._instance = super(ContextManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        # The __init__ might be called multiple times, but we only want to initialize once.
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        
+        self.location_context: str = ""
+        self.store_catalog: str = ""
+        self._initialized = True
+        logging.info("ContextManager initialized.")
+
+    def build_static_context(self, store_id: int, customer_id: str):
+        """
+        Calls the necessary functions to generate the static Markdown contexts.
+        This should be run once at application startup by the main API service.
+        
+        Args:
+            store_id: A default or primary store_id to generate the initial catalog.
+            customer_id: A guest customer_id for generating the initial catalog.
+        """
+        logging.info("Building static context: Fetching locations and product catalog...")
+        
+        # 1. Generate Location & Delivery Info Markdown
+        # This function calls multiple APIs and combines them into one string.
+        self.location_context = generate_location_and_delivery_markdown()
+        if not self.location_context:
+            logging.error("CRITICAL: Failed to build location context!")
+            self.location_context = "# Location Information\n\n*Error: Could not retrieve location data.*"
+
+        # 2. Generate Store Product Catalog Markdown
+        # This function calls the product list API and formats it.
+        self.store_catalog = get_product_catalog_as_markdown(store_id=store_id, customer_id=customer_id)
+        if not self.store_catalog:
+            logging.error("CRITICAL: Failed to build store catalog context!")
+            self.store_catalog = "# Store Catalog\n\n*Error: Could not retrieve product catalog.*"
+
+        logging.info("✅ Static context build complete. The application is ready.")
+
+# Create a single instance that will be imported and used by other parts of the application.
+context_manager = ContextManager()
+
+================================================================================
+--- File: cogops/agent.py ---
+================================================================================
+
+# FILE: cogops/agent.py
+
+import os
+import yaml
+import json
+import asyncio
+import logging
+from typing import AsyncGenerator, Dict, Any, List, Tuple
+
+# --- Exception Imports for Network Errors ---
+from openai import APIConnectionError, APITimeoutError
+from requests.exceptions import RequestException
+
+# --- Core Component Imports ---
+# We now import the AGENT_PROMPT template directly, as the TokenManager will handle formatting.
+from cogops.prompt import AGENT_PROMPT
+from cogops.tools.tools import tools_list, available_tools_map
+from cogops.models.qwen3async_llm import AsyncLLMService
+from cogops.tools.private.user_tools import generate_full_user_context_markdown
+# NEW: Import the TokenManager, which is now essential for safe prompt construction.
+from cogops.utils.token_manager import TokenManager
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ChatAgent:
+    """
+    An end-to-end conversational agent that uses a tool-based pipeline.
+    This agent is session-aware and holds user metadata and context strings.
+    """
+    def __init__(self, config_path: str, session_meta: Dict[str, Any], location_context: str, store_catalog: str):
+        """
+        Initializes the ChatAgent for a specific user session.
+
+        Args:
+            config_path: Path to the main configuration YAML file.
+            session_meta: A dictionary containing session-specific data like store_id and user_id.
+            location_context: A pre-generated Markdown string with all location/delivery info.
+            store_catalog: A pre-generated Markdown string with the store's product catalog.
+        """
+        logging.info(f"Initializing ChatAgent with session_meta: {session_meta}")
+        self.config = self._load_config(config_path)
+        
+        # --- Session & Agent Identity ---
+        self.session_meta = session_meta
+        self.agent_name = self.config.get('agent_name', 'Bengal Meat Assistant')
+        self.agent_story = self.config.get('agent_story', 'I am a helpful AI assistant from Bengal Meat.')
+
+        # --- Context Storage ---
+        # User-specific context (profile, orders) - loaded by _enrich_context for logged-in users.
+        self.user_context: str = "# User Context\n\n*This is a guest user session.*"
+        # Static, global context passed in from the ContextManager.
+        self.location_context: str = location_context
+        self.store_catalog: str = store_catalog
+
+        # --- Initialize LLM and Tokenizer ---
+        self.llm_service = self._initialize_llm_service()
+        
+        # CORRECTED: Initialize and use the TokenManager for safe prompt building.
+        tm_config = self.config['token_management']
+        tokenizer_model = os.getenv(tm_config['tokenizer_model_name_env'])
+        if not tokenizer_model:
+            raise ValueError(f"Missing environment variable for tokenizer: {tm_config['tokenizer_model_name_env']}")
+        
+        self.token_manager = TokenManager(
+            model_name=tokenizer_model,
+            reservation_tokens=tm_config['prompt_template_reservation_tokens'],
+            history_budget=tm_config['history_truncation_budget']
+        )
+
+        # --- Conversation and Tool Management ---
+        self.history: List[Tuple[str, str]] = []
+        self.history_window = self.config['conversation']['history_window']
+        self.llm_call_params = self.config.get('llm_call_parameters', {})
+        self.response_templates = self.config['response_templates']
+        
+        self.tools_schema = tools_list
+        self.tool_functions = available_tools_map
+        self.tools_description = json.dumps(self.tools_schema, indent=4)
+
+        logging.info("✅ ChatAgent object created. User-specific context enrichment pending.")
+
+    async def _enrich_context(self):
+        """
+        For logged-in users, calls the master context generation function to build
+        a single Markdown string containing their profile and order history.
+        """
+        if not self.session_meta.get('user_id'):
+            logging.info("Guest user session. Skipping user-specific context enrichment.")
+            return
+
+        logging.info(f"Registered user detected (ID: {self.session_meta['user_id']}). Enriching user context...")
+        
+        try:
+            # Run the blocking network calls in a separate thread to not block the event loop
+            context_string = await asyncio.to_thread(
+                generate_full_user_context_markdown, 
+                self.session_meta
+            )
+            self.user_context = context_string
+            logging.info("User context enrichment complete.")
+        except Exception as e:
+            logging.error(f"Failed to enrich user context for user {self.session_meta['user_id']}: {e}", exc_info=True)
+            self.user_context = "# User Context\n\n*Error: Could not retrieve user profile and order data.*"
+
+    def _load_config(self, config_path: str) -> Dict:
+        """Loads the agent's YAML configuration file."""
+        logging.info(f"Loading configuration from: {config_path}")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"[FATAL ERROR] Configuration file not found at: {config_path}")
+            raise
+    
+    def _initialize_llm_service(self) -> AsyncLLMService:
+        """Initializes the asynchronous LLM service client from configuration."""
+        logging.info("Initializing primary LLM service...")
+        cfg = self.config['llm_service']
+        api_key = os.getenv(cfg['api_key_env'])
+        model = os.getenv(cfg['model_name_env'])
+        url = os.getenv(cfg['base_url_env'])
+        max_tokens = cfg.get('max_context_tokens', 32000)
+        
+        if not all([api_key, model, url]):
+            raise ValueError(f"Missing one or more environment variables for LLM service: Check {cfg['api_key_env']}, {cfg['model_name_env']}, and {cfg['base_url_env']}")
+            
+        return AsyncLLMService(api_key, model, url, max_tokens)
+
+    def _format_conversation_history(self) -> str:
+        """Formats the stored conversation history into a string for the prompt."""
+        if not self.history:
+            return "No conversation history yet."
+        return "\n---\n".join([f"User: {u}\nAssistant: {a}" for u, a in self.history])
+
+    async def generate_welcome_message(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Generates a welcome message that acknowledges if the user is logged in.
+        """
+        logging.info("Generating welcome message for the session.")
+        
+        if self.session_meta.get('user_id'):
+            # Acknowledges a returning/logged-in user
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে আবার স্বাগতম! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
+        else:
+            # Standard welcome for guest users
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম! আমি {self.agent_name}। আমি আপনাকে আমাদের পণ্য, অফার এবং স্টোর খুঁজে পেতে সাহায্য করতে পারি। বলুন, কীভাবে শুরু করতে পারি?"
+
+        yield {"type": "welcome_message", "content": welcome_text}
+        
+    async def process_query(self, user_query: str) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Processes a user's query by constructing a detailed, token-safe prompt
+        and orchestrating LLM and tool calls.
+        """
+        logging.info(f"\n--- Processing Query: '{user_query}' for store_id: {self.session_meta.get('store_id')} ---")
+        
+        try:
+            # CRITICAL FIX: Use the TokenManager to build a context-aware and safe prompt.
+            # This prevents context overflow errors by truncating history/context if needed.
+            master_prompt = self.token_manager.build_safe_prompt(
+                template=AGENT_PROMPT,
+                max_tokens=self.llm_service.max_context_tokens,
+                # Pass all components to the builder. The manager handles formatting.
+                agent_name=self.agent_name,
+                agent_story=self.agent_story,
+                tools_description=self.tools_description,
+                history=self.history, # Pass the raw list of tuples
+                user_query=user_query,
+                session_meta=json.dumps(self.session_meta, indent=2),
+                user_context=self.user_context,
+                location_context=self.location_context,
+                store_catalog=self.store_catalog
+            )
+            
+            messages = [
+                {"role": "system", "content": master_prompt},
+                {"role": "user", "content": user_query}
+            ]
+
+            full_final_answer = []
+            # The stream_with_tool_calls function now handles yielding structured events.
+            stream_generator = self.llm_service.stream_with_tool_calls(
+                messages=messages,
+                tools=self.tools_schema,
+                available_tools=self.tool_functions,
+                session_meta=self.session_meta, # Pass session_meta for private tool calls
+                **self.llm_call_params
+            )
+
+            async for event in stream_generator:
+                # Collect content from 'answer_chunk' events to build the full response for history.
+                if event.get("type") == "answer_chunk":
+                    full_final_answer.append(event.get("content", ""))
+                # Stream the entire event (tool_call or chunk) directly to the frontend.
+                yield event
+
+            final_answer_str = "".join(full_final_answer).strip()
+
+            if final_answer_str:
+                self.history.append((user_query, final_answer_str))
+            
+            if len(self.history) > self.history_window:
+                self.history.pop(0)
+
+        except (APIConnectionError, APITimeoutError, RequestException) as e:
+            logging.error(f"A network service is unavailable. Underlying error: {e}")
+            yield {"type": "error", "content": self.response_templates['error_fallback']}
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during query processing: {e}", exc_info=True)
+            yield {"type": "error", "content": self.response_templates['error_fallback']}
+
+================================================================================
+--- File: cogops/prompt.py ---
+================================================================================
+
+# FILE: prompt.py
+import json
+from typing import Dict, Any
+
+# FILE: prompt.py
+
+# ... (imports remain the same) ...
+
+AGENT_PROMPT = """
+### **[MASTER SYSTEM PROMPT - BENGAL MEAT SALES & SUPPORT ASSISTANT]**
+
+**[SECTION 1: CORE DIRECTIVES & PERSONA]**
+
+You are **{agent_name}**, an autonomous AI sales and support assistant for Bengal Meat. Your purpose is to help customers feel guided, assured, and valued. This document is your immutable Standard Operating Procedure (SOP).
+
+*   **Principle 1: Absolute Language Adherence.** This is your most important linguistic rule. The language of your final response **MUST STRICTLY** match the language of the user's query.
+    *   If the user's query is in **English**, you **MUST** respond **ONLY** in **English**.
+    *   If the user's query is in **Bangla** or **Romanized Bangla ('Banglish')**, you **MUST** respond **ONLY** in standard, formal **Bangla**. There are no exceptions to this rule.
+
+*   **Principle 2: Persona & Tone.** Your personality is caring, professional, and dependable. Your tone must be formal but friendly, warm, and respectful. Your style is clear, concise, and polite. You **MUST ALWAYS** use the formal "আপনি" pronoun when addressing users in Bangla; never use "তুমি".
+
+*   **Principle 3: The Principle of Assumed Relevance.** This is your primary operational directive for handling user queries.
+    1.  After ensuring a query is not harmful or malicious (per the Safety Protocol), your default assumption **MUST** be that the user's intent is related to Bengal Meat.
+    2.  If you are not 100% certain about the user's intent but it has a chance of being related to Bengal Meat's products, services, or policies, your first action **MUST** be to use the `retrieve_knowledge` tool with the user's query. This is your primary method for checking if a topic is covered.
+    3.  For any query that explicitly mentions a product, price, or stock, you **MUST** use the appropriate tools (`get_product_details_as_markdown`, etc.) to get live information. **You MUST NOT answer these types of questions from memory.**
+    4.  Only after exhausting tool-based options should you consider the query off-topic.
+
+*   **Principle 4: Strict Scope Limitation.** Your knowledge is strictly limited to Bengal Meat's products and services. If you have confirmed through the `retrieve_knowledge` tool that a topic is not covered, you **MUST POLITELY DECLINE** to answer, following the [Off-Topic Protocol].
+
+*   **Principle 5: Proactive Sales & Engagement Protocol.** Your primary role is to intelligently guide the customer. After successfully answering a query, you **MUST** attempt to engage them further by suggesting relevant promotions, best sellers, or related products.
+
+*   **Principle 6: Intelligent Promotion Protocol.** Your goal is to be a helpful shopping assistant, not a disruptive advertiser. Promotional content must always feel relevant and timely.
+    1.  **Answer First, Promote Second:** ALWAYS answer the user's direct question completely before offering promotional content.
+    2.  **Ensure Strict Relevance:** Only suggest promotions related to the user's current query.
+    3.  **Offer, Don't Announce:** Frame the promotion as a helpful tip and an engaging question.
+    4.  **Don't Overwhelm:** Mention only the single most relevant promotion unless the user explicitly asks for all offers.
+    
+*   **Principle 7: Personalization Protocol.** If the [USER CONTEXT] section is not empty, you **MUST** leverage this information to create a personalized experience (e.g., greet the user by name, use their order history for suggestions, and refer to their saved addresses).
+
+*   **Principle 8: Unwavering Safety.** Adhere strictly to the multi-tiered **[Safety & Guardrail Protocol]**.
+
+*   **Principle 9: Contextual Analysis Before Clarification.** Your actions for resolving ambiguity must follow a strict order:
+    1.  **First, Meticulously Analyze History:** You **MUST** review the full `Conversation History` to see if the context clarifies the current query.
+    2.  **Second, Attempt Knowledge Retrieval:** As per Principle 3, use the `retrieve_knowledge` tool to check for relevant information.
+    3.  **Third, Ask for Clarification:** Only if the query remains ambiguous *after* analyzing history and attempting a tool call, your final resort **MUST** be to politely ask for clarification.
+
+*   **Principle 10: Silent, Complete Execution.** Operate silently. **NEVER** announce your internal actions. You **MUST** complete your entire internal plan (including all necessary tool calls) *before* generating a final response. Your final output must always be a complete, user-facing sentence. **NEVER** output the `<tool_call>` syntax as your final answer.
+
+"""
+# --- End of Section 1 ---
+# (Continue from Section 1)
+
+# (Continue from Section 1)
+
+AGENT_PROMPT += """
+---
+
+**[SECTION 2: AUTONOMOUS TOOLKIT & USAGE PROTOCOL]**
+
+*(This section is dynamically populated with your available tools.)*
+{tools_description}
+
+#### **[Tool Usage Protocol]**
+
+You must adhere to the following rules when using your tools. This is a mandatory part of your operational logic.
+
+*   **1. The Decision Rule: Analyze and Match.**
+    *   Before selecting a tool, you must silently reason about the user's specific intent.
+    *   Your choice of tool **MUST** be a direct, logical match to the function's `description` in the schema above.
+
+*   **2. The Parameter Mandate: Precision is Required.**
+    *   You **MUST** correctly extract all required parameters from the user's query, conversation history, or the `[SESSION METADATA]`.
+    *   **For Public Tools** (like `get_product_details_as_markdown`): You **MUST** provide the `store_id` and a `customer_id`. If the user is not logged in, you **MUST** use the default guest `customer_id`, which is `'369'`.
+    *   **For Private Tools** (like `get_user_order_profile_as_markdown`): You **MUST** pass the entire, unaltered `session_meta` object. This is non-negotiable as it contains the authentication tokens required for secure access.
+
+*   **3. The Synthesis Mandate: Think, Act, then Respond.**
+    *   Your operational loop is: `Think -> Call Tool(s) -> Synthesize -> Respond`.
+    *   After your planned sequence of tool calls is complete, your **ONLY** next action is to formulate the final, user-facing response in the correct language.
+    *   **NEVER** output the raw tool call syntax like `<tool_code>...</tool_code>` as your final answer to the user.
+
+*   **4. The Failure Protocol: Graceful Recovery.**
+    *   If a tool call fails, returns an error, or provides no data (`[]`, `None`), you **MUST** respond gracefully with: "একটি প্রযুক্তিগত ত্রুটির কারণে আমি এই মুহূর্তে তথ্যটি যাচাই করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।" (Due to a technical error, I cannot verify the information right now. Please try again after some time.)
+
+---
+"""
+# (Continue from the end of SECTION 3)
+
+AGENT_PROMPT += """
+---
+
+**[SECTION 4: GOLD-STANDARD EXAMPLES]**
+
+*This section provides critical examples of your expected thought process and behavior. You must study these patterns to understand how to combine your context and tools effectively.*
+
+*   **Case 1: Simple Knowledge Query**
+    *   **User:** "ফেরত দেওয়ার নিয়ম কী?" (What is the return policy?)
+    *   **Chain of Thought:** The user is asking about a company policy. The `retrieve_knowledge` tool is the perfect fit.
+    *   **Action:** Call `retrieve_knowledge(query="রিটার্ন পলিসি")`.
+    *   **Final Response:** (Summarize the policy found by the tool in clear Bangla).
+
+*   **Case 2: Specific Product Query & Proactive Offer Mention**
+    *   **User:** "বিফ টি-বোন স্টেক এর দাম কত?" (What's the price of a Beef T-bone steak?)
+    *   **Chain of Thought:** User wants the price of a specific product. I must find the 'slug' for "Beef T-bone Steak" in the `[STORE CATALOG]`. Then, I will call `get_product_details_as_markdown` to get the live price. The tool's output may contain an active offer which I must mention.
+    *   **Action Step 1:** Find "Beef T-bone Steak" in `[STORE CATALOG]`, identify its slug (e.g., 'beef-t-bone-steak').
+    *   **Action Step 2:** Call `get_product_details_as_markdown(slug='beef-t-bone-steak', store_id=37, customer_id='369')`.
+    *   **Final Response:** "একটি বিফ টি-বোন স্টেক-এর দাম ১০২০ টাকা। এই মুহূর্তে আমাদের স্টেক আইটেমগুলোর ওপর একটি বিশেষ অফার চলছে, যেখানে আপনি ৫০ টাকা ছাড় পাচ্ছেন। আপনি কি এটি আপনার কার্টে যোগ করতে চান?"
+
+*   **Case 3: Ambiguity Resolution using History & Clarification**
+    *   **User (Turn 1):** "টেন্ডারলয়েন আছে?" (Do you have tenderloin?)
+    *   **Chain of Thought (Turn 1):** The user's query is ambiguous. "Tenderloin" could be beef or mutton. I will check the `[STORE CATALOG]`. I see both 'Beef Tenderloin' and 'Mutton Tenderloin'. I must ask the user to clarify.
+    *   **Final Response (Turn 1):** "হ্যাঁ, আমাদের টেন্ডারলয়েন পাওয়া যায়। আপনি কি গরুর মাংসের টেন্ডারলয়েন খুঁজছেন নাকি খাসির মাংসের?" (Yes, we have tenderloin. Are you looking for beef tenderloin or mutton?)
+    *   **User (Turn 2):** "গরুর" (Beef)
+    *   **Chain of Thought (Turn 2):** The user has clarified they want beef. The conversation history confirms this. Now I will find the slug for "Beef Tenderloin" in the `[STORE CATALOG]` and call the details tool.
+    *   **Action (Turn 2):** Call `get_product_details_as_markdown(slug='beef-tenderloin', store_id=37, customer_id='369')`.
+    *   **Final Response (Turn 2):** (Provide the details for Beef Tenderloin from the tool's output).
+
+*   **Case 4: Complex Multi-Step Reasoning with Location Context**
+    *   **User:** "সিলেটে বিফ বার্গার প্যাটি পাওয়া যাবে?" (Is Beef Burger Patty available in Sylhet?)
+    *   **Chain of Thought:**
+        1.  User asks for a product in a specific city, "Sylhet".
+        2.  I **MUST** check the `[LOCATION CONTEXT]` to find a store ID for Sylhet. I see "BengalMeat Gourmet Butcher Shop - Subid Bazar (Sylhet)" with `Store ID: 49`.
+        3.  I need the slug for "Beef Burger Patty". I find it in the `[STORE CATALOG]`: 'beef-burger-patty'.
+        4.  Call the details tool with the *Sylhet store ID*: `get_product_details_as_markdown(slug='beef-burger-patty', store_id=49, ...)`. The result is "Out of Stock".
+        5.  As a helpful assistant, I should not stop. I will check a major city like Dhaka as an alternative.
+        6.  I check `[LOCATION CONTEXT]` again and find a Dhaka store, e.g., "Gourmet Butcher Shop Dhanmondi-27" with `Store ID: 50`.
+        7.  I call the tool again with the *Dhaka store ID*: `get_product_details_as_markdown(slug='beef-burger-patty', store_id=50, ...)`. The result is "In Stock".
+        8.  I will synthesize this into a complete, helpful answer.
+    *   **Final Response:** "এই মুহূর্তে আমাদের সিলেটের স্টোরগুলোতে বিফ বার্গার প্যাটি স্টক শেষ হয়ে গেছে। তবে, ঢাকার ধানমন্ডি শাখায় এটি পাওয়া যাচ্ছে। আমি কি আপনার জন্য ঢাকার অন্য কোনো এলাকার স্টকে এটি আছে কিনা তা পরীক্ষা করে দেখব?" (Currently, Beef Burger Patty is out of stock in our Sylhet stores. However, it is available at our Dhanmondi branch in Dhaka. Would you like me to check the stock in any other area in Dhaka for you?)
+
+*   **Case 5: Proactive Cross-selling (The Correct Way)**
+    *   **User:** "আপনাদের বিফ কিমা আছে?" (Do you have beef keema?)
+    *   **Chain of Thought:** User is asking about a specific product. I will find the slug for 'Beef Keema' in the `[STORE CATALOG]`, get its details, answer the user, and then proactively suggest a relevant complementary product.
+    *   **Action Step 1:** Find slug 'beef-keema' from `[STORE CATALOG]`.
+    *   **Action Step 2:** Call `get_product_details_as_markdown(slug='beef-keema', ...)`.
+    *   **Final Response:** "হ্যাঁ, আমাদের বিফ কিমা পাওয়া যাচ্ছে। ৫০০ গ্রামের একটি প্যাকেটের দাম ৫৫০ টাকা। আমাদের অনেক গ্রাহক বিফ কিমার সাথে 'শামি কাবাব' তৈরি করতে পছন্দ করেন। এই মুহূর্তে আমাদের 'বিফ শামি কাবাব'-এর ওপর ২৫ টাকা ছাড় চলছে। আপনি কি এটি দেখতে আগ্রহী?" (Yes, we have beef keema. A 500g packet costs 550 BDT. Many of our customers like to make 'Shami Kebab' with beef keema. Currently, there is a 25 TK discount on our 'Beef Shami Kebab'. Would you be interested in seeing it?)
+
+*   **Case 6: Personalized Acknowledgment & Proactive Suggestion**
+    *   **Context:** A logged-in user ("MO MO") is in a session. The `[USER CONTEXT]` shows they have previously purchased "Beef Bone In".
+    *   **User:** "What is the price of Beef Bone In?"
+    *   **Chain of Thought:** The user is logged in and asking about a product. I must check `[USER CONTEXT]`. I see their name is MO MO and they have bought this exact item before. I will answer their question and add a personalized touch acknowledging their preference, then make a relevant cross-sell suggestion.
+    *   **Action:** Call `get_product_details_as_markdown(slug='beef-bone-in', ...)`.
+    *   **Final Response:** "Hi MO MO, welcome back! I see the 'Beef Bone In' is one of your favorites. To answer your question, the price is currently 860 BDT per Kg. Since you enjoy making curries, you might also like our special 'Mezbani Masala' to go with it. Would you like to add either of these to your cart?"
+
+*   **Case 7: Specific Order Status Check**
+    *   **User:** "আমার অর্ডার ২৫০৮১৪১১... এর কী অবস্থা?" (What is the status of my order 25081411...?)
+    *   **Chain of Thought:** The user is logged in and has provided a specific order code. The `get_user_order_profile_as_markdown` tool is the correct choice. I must pass the `order_code` to the tool.
+    *   **Action:** Call `get_user_order_profile_as_markdown(order_code="25081411552764833049")`.
+    *   **Final Response:** "আপনার অর্ডার `25081411552764833049`-এর বর্তমান স্ট্যাটাস 'Pending' দেখাচ্ছে। এটি আগস্ট ১৪, ২০২৫ তারিখে প্লেস করা হয়েছিল। আপনি কি এই অর্ডার সম্পর্কে আরও কিছু জানতে চান?"
+
+*   **Case 8: Using Saved Address to Proactively Answer**
+    *   **Context:** `[USER CONTEXT]` shows the user has a saved address in 'Dhanmondi'.
+    *   **User:** "Can you deliver to my home?"
+    *   **Chain of Thought:** The user is asking about delivery to their home. Their `[USER CONTEXT]` has a saved address. I will check the `[LOCATION CONTEXT]` to see if the area 'Dhanmondi' is listed as a delivery area.
+    *   **Final Response:** "Yes, we can! I see you have a saved address in Dhanmondi, which is within our delivery zone. Would you like to place an order for that address?"
+
+---
+
+**[START OF TASK]**
+
+**[SESSION METADATA]**
+{session_meta}
+
+**[LOCATION CONTEXT]**
+{location_context}
+
+**[STORE CATALOG]**
+{store_catalog}
+
+**[USER CONTEXT]**
+{user_context}
+
+**[CONVERSATION HISTORY]**
+{conversation_history}
+
+**[CURRENT USER QUERY]**
+{user_query}
+
+**[AGENT IDENTITY]**
+*   **Agent Name:** {agent_name}
+*   **Agent Story:** {agent_story}
+
+**[YOUR RESPONSE FOR THIS TURN]**
+"""
+
+def get_agent_prompt() -> str:
+    """Returns the static master prompt template."""
+    return AGENT_PROMPT
+
+================================================================================
+--- File: cogops/__init__.py ---
+================================================================================
+
+
+
+================================================================================
+--- File: cogops/models/qwen3async_llm.py ---
+================================================================================
+
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, APIError, BadRequestError
+from typing import Any, Type, TypeVar, AsyncGenerator, List, Dict
+from pydantic import BaseModel, Field
+from cogops.utils.prompt import build_structured_prompt
+from cogops.tools.tools import tools_list, available_tools_map
+# Load environment variables and set up logging
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+PydanticModel = TypeVar("PydanticModel", bound=BaseModel)
+
+class ContextLengthExceededError(Exception):
+    """Custom exception for when a prompt exceeds the model's context window."""
+    pass
+
+class AsyncLLMService:
+    """
+    An ASYNCHRONOUS client for OpenAI-compatible APIs.
+    """
+    def __init__(self, api_key: str, model: str, base_url: str, max_context_tokens: int):
+        if not api_key:
+            raise ValueError("API key cannot be empty.")
+        
+        self.model = model
+        self.max_context_tokens = max_context_tokens
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        
+        print(f"✅ AsyncLLMService initialized for model '{self.model}' with max_tokens={self.max_context_tokens}.")
+
+    async def invoke(self, prompt: str, **kwargs: Any) -> str:
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            response = await self.client.chat.completions.create(model=self.model, messages=messages, **kwargs)
+            return response.choices[0].message.content or ""
+        except BadRequestError as e:
+            if "context length" in str(e).lower() or "too large" in str(e).lower():
+                logging.error(f"Prompt exceeded context window for model {self.model}.")
+                raise ContextLengthExceededError(f"Prompt is too long for the model's {self.max_context_tokens} token limit.") from e
+            else:
+                logging.error(f"Unhandled BadRequestError during invoke: {e}")
+                raise
+        except Exception as e:
+            logging.error(f"An error occurred during invoke: {e}", exc_info=True)
+            raise
+
+    async def stream(self, prompt: str, **kwargs: Any) -> AsyncGenerator[str, None]:
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            stream = await self.client.chat.completions.create(model=self.model, messages=messages, stream=True, **kwargs)
+            async for chunk in stream:
+                content_chunk = chunk.choices[0].delta.content if chunk.choices else None
+                if content_chunk:
+                    yield content_chunk
+        except BadRequestError as e:
+            if "context length" in str(e).lower() or "too large" in str(e).lower():
+                logging.error(f"Prompt exceeded context window for model {self.model}.")
+                raise ContextLengthExceededError(f"Prompt is too long for the model's {self.max_context_tokens} token limit.") from e
+            else:
+                logging.error(f"Unhandled BadRequestError during stream: {e}")
+                raise
+        except Exception as e:
+            logging.error(f"An error occurred during stream: {e}", exc_info=True)
+            raise
+
+    async def invoke_structured(
+        self, prompt: str, response_model: Type[PydanticModel], **kwargs: Any
+    ) -> PydanticModel:
+        # --- MODIFIED: Use the shared utility function ---
+        structured_prompt = build_structured_prompt(prompt, response_model)
+        messages = [{"role": "user", "content": structured_prompt}]
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model, messages=messages, response_format={"type": "json_object"}, **kwargs
+            )
+            json_response_str = response.choices[0].message.content
+            if not json_response_str:
+                raise ValueError("The model returned an empty response.")
+            return response_model.model_validate_json(json_response_str)
+        except BadRequestError as e:
+            if "context length" in str(e).lower() or "too large" in str(e).lower():
+                logging.error(f"Prompt exceeded context window for model {self.model}.")
+                raise ContextLengthExceededError(f"Prompt is too long for the model's {self.max_context_tokens} token limit.") from e
+            else:
+                logging.error(f"Unhandled BadRequestError during structured invoke: {e}")
+                raise
+        except Exception as e:
+            logging.error(f"An error occurred during structured invoke: {e}", exc_info=True)
+            raise
+
+    async def invoke_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        available_tools: Dict[str, callable],
+        **kwargs: Any  # <-- FIX: Accept kwargs
+    ) -> str:
+        """Handles a multi-step conversation with tool-calling capabilities asynchronously."""
+        try:
+            print("\n   [Step 1: Asking model if a tool is needed...]")
+            response = await self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=tools, tool_choice="auto", **kwargs # <-- FIX: Pass kwargs
+            )
+            response_message = response.choices[0].message
+            tool_calls = response_message.tool_calls
+            
+            if not tool_calls:
+                print("   [Model responded directly without using a tool.]")
+                return response_message.content or ""
+
+            print("   [Step 2: Model requested a tool call. Executing it...]")
+            messages.append(response_message)
+            
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_to_call = available_tools.get(function_name)
+                
+                if function_to_call:
+                    function_args = json.loads(tool_call.function.arguments or "{}")
+                    if asyncio.iscoroutinefunction(function_to_call):
+                        function_response = await function_to_call(**function_args)
+                    else:
+                        function_response = function_to_call(**function_args)
+                    messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": str(function_response),
+                    })
+                else:
+                    logging.warning(f"Model tried to call an unknown tool: {function_name}")
+            
+            print("   [Step 3: Sending tool result back to model for final answer...]")
+            second_response = await self.client.chat.completions.create(
+                model=self.model, messages=messages, **kwargs # <-- FIX: Pass kwargs
+            )
+            return second_response.choices[0].message.content or "Model did not provide a final response."
+        except Exception as e:
+            logging.error(f"An error occurred during tool invocation: {e}", exc_info=True)
+            raise
+
+    # FILE: models/qwen3async_llm.py
+
+    async def stream_with_tool_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        available_tools: Dict[str, callable],
+        session_meta: Dict[str, Any],  # Add session_meta to the signature
+        **kwargs: Any
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Handles a multi-step conversation with tool-calling capabilities, streaming structured JSON events.
+        This is the core of the agent's reasoning and action loop.
+        """
+        try:
+            logging.info("   [Step 1: Streaming model response to check for tool calls...]")
+
+            # === FIRST LLM CALL: Check if a tool is needed or if the model can answer directly ===
+            stream = await self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=tools, tool_choice="auto", stream=True, **kwargs
+            )
+
+            # Prepare to reconstruct the full message from streamed chunks
+            response_message = {"role": "assistant", "content": "", "tool_calls": []}
+            tool_call_index_map = {} # Used to correctly reassemble tool call arguments
+
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                # If the chunk has text content, it's a direct answer. Stream it immediately.
+                if delta.content:
+                    # Yield a structured event for the frontend
+                    yield {"type": "answer_chunk", "content": delta.content}
+                    if response_message["content"] is not None:
+                         response_message["content"] += delta.content
+
+                # If the chunk has tool call data, reconstruct it.
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        index = tc_delta.index
+                        if index not in tool_call_index_map:
+                            tool_call_index_map[index] = {
+                                "id": "", "type": "function", "function": {"name": "", "arguments": ""}
+                            }
+                        if tc_delta.id:
+                            tool_call_index_map[index]["id"] += tc_delta.id
+                        if tc_delta.function and tc_delta.function.name:
+                            tool_call_index_map[index]["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function and tc_delta.function.arguments:
+                            tool_call_index_map[index]["function"]["arguments"] += tc_delta.function.arguments
+
+            # Finalize the reconstructed tool calls
+            if tool_call_index_map:
+                response_message["tool_calls"] = list(tool_call_index_map.values())
+            
+            tool_calls = response_message["tool_calls"]
+
+            # If there were no tool calls, the direct answer is complete. We can stop here.
+            if not tool_calls:
+                logging.info("   [Model responded directly without using a tool.]")
+                return
+
+            # --- If we reach here, the model wants to use one or more tools ---
+            logging.info(f"   [Step 2: Model requested {len(tool_calls)} tool call(s). Executing them...]")
+            messages.append(response_message) # Add the assistant's decision to call a tool to the history
+
+            # === TOOL EXECUTION PHASE ===
+            for tool_call in tool_calls:
+                function_name = tool_call["function"]["name"]
+                
+                # Yield a "thinking" event to the frontend BEFORE running the tool
+                yield {"type": "tool_call", "tool_name": function_name}
+
+                function_to_call = available_tools.get(function_name)
+                if function_to_call:
+                    try:
+                        function_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                        
+                        # CRITICAL: Inject session_meta for private/session-aware tools
+                        # Add any other tool names here that require the session_meta object.
+                        if function_name in ["get_user_order_profile_as_markdown", "get_product_details_as_markdown", "get_active_promotions"]:
+                            function_args['session_meta'] = session_meta
+                        
+                        # Execute the tool function (sync or async)
+                        if asyncio.iscoroutinefunction(function_to_call):
+                            function_response = await function_to_call(**function_args)
+                        else:
+                            # Run synchronous tool functions in a separate thread
+                            function_response = await asyncio.to_thread(function_to_call, **function_args)
+                        
+                        # Append the tool's result to the message history
+                        messages.append({
+                            "tool_call_id": tool_call["id"],
+                            "role": "tool",
+                            "name": function_name,
+                            "content": str(function_response),
+                        })
+                    except Exception as e:
+                        logging.error(f"Error executing tool '{function_name}': {e}", exc_info=True)
+                        messages.append({
+                            "tool_call_id": tool_call["id"], "role": "tool", "name": function_name,
+                            "content": f"Error: Tool execution failed with message: {e}"
+                        })
+                else:
+                    logging.warning(f"Model tried to call an unknown tool: {function_name}")
+
+            # === FINAL LLM CALL: Synthesize the final answer using the tool results ===
+            logging.info("   [Step 3: Streaming final answer from model...]")
+            final_stream = await self.client.chat.completions.create(
+                model=self.model, messages=messages, stream=True, **kwargs
+            )
+
+            async for chunk in final_stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    # Yield the final answer chunks in the correct event format
+                    yield {"type": "answer_chunk", "content": chunk.choices[0].delta.content}
+
+        except Exception as e:
+            logging.error(f"An error occurred during the streaming tool invocation process: {e}", exc_info=True)
+            # Yield a structured error event to the frontend
+            yield {"type": "error", "content": "An internal error occurred while processing your request."}
+        
+async def main():
+    # --- Pydantic Models for Testing ---
+    class NIDInfo(BaseModel):
+        name: str = Field(description="The person's full name in Bengali.")
+        father_name: str = Field(description="The person's father's name in Bengali.")
+        occupation: str = Field(description="The person's occupation in Bengali.")
+
+    class PassportInfo(BaseModel):
+        application_type: str = Field(description="The type of passport application, e.g., 'নতুন' (New) or 'নবায়ন' (Renewal).")
+        delivery_type: str = Field(description="The delivery speed, e.g., 'জরুরি' (Urgent) or 'সাধারণ' (Regular).")
+        validity_years: int = Field(description="The validity period of the passport in years.")
+        
+    # --- Setup and Initialization ---
+    print("--- Running Asynchronous LLMService Tests ---")
+    
+    # Load Qwen LLM Config
+    api_key = os.getenv("VLLM_API_KEY")
+    model = os.getenv("VLLM_MODEL_NAME")
+    base_url = os.getenv("VLLM_BASE_URL")
+    llm_service = None
+    if all([api_key, model, base_url]):
+        llm_service = AsyncLLMService(api_key, model, base_url, max_context_tokens=32000)
+    else:
+        print("\nWARNING: Qwen LLM environment variables not set. Skipping tests.")
+        return
+
+    # --- Test Cases ---
+
+    # Test 1: Invoke
+    print("\n--- Test 1: Invoke (Async) ---")
+    try:
+        prompt = "জন্ম নিবন্ধন সনদের গুরুত্ব কী?"
+        print(f"Prompt: {prompt}")
+        response = await llm_service.invoke(prompt, temperature=0.1, max_tokens=256)
+        print(f"Response:\n{response}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Test 2: Stream
+    print("\n--- Test 2: Stream (Async) ---")
+    try:
+        prompt = "পাসপোর্ট অফিসের একজন কর্মকর্তার একটি সংক্ষিপ্ত বর্ণনা দিন।"
+        print(f"Prompt: {prompt}\nStreaming Response:")
+        async for chunk in llm_service.stream(prompt, temperature=0.2, max_tokens=256):
+            print(chunk, end="", flush=True)
+        print()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Test 3: Structured Invoke
+    print("\n--- Test 3: Structured Invoke (Async) ---")
+    try:
+        prompt = "আমার নাম 'করিম চৌধুরী', পিতার নাম 'রহিম চৌধুরী', আমি একজন ছাত্র। এই তথ্য দিয়ে একটি এনআইডি কার্ডের তথ্য তৈরি করুন।"
+        print(f"Prompt: {prompt}")
+        nid_data = await llm_service.invoke_structured(prompt, NIDInfo, temperature=0.0)
+        print(f"Parsed Response:\n{nid_data.model_dump_json(indent=2)}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+            
+    # Test 4: Invoke with Tools (Time Tool Example)
+    print("\n--- Test 4: Invoke with Tools - Time Tool Example (Async) ---")
+    try:
+        user_prompt = "এখন সময় কত?"
+        print(f"Prompt: {user_prompt}")
+        messages = [{"role": "user", "content": user_prompt}]
+        final_response = await llm_service.invoke_with_tools(
+            messages=messages, tools=tools_list, available_tools=available_tools_map, temperature=0.0
+        )
+        print(f"\nFinal Model Response:\n{final_response}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Test 5: Stream with Tool Calls (Time Tool Example)
+    print("\n--- Test 5: Stream with Tool Calls - Time Tool Example (Async) ---")
+    try:
+        user_prompt = "এখন সময় কত?"
+        print(f"Prompt: {user_prompt}\nStreaming Response:")
+        messages = [{"role": "user", "content": user_prompt}]
+        async for chunk in llm_service.stream_with_tool_calls(
+            messages=messages, tools=tools_list, available_tools=available_tools_map, temperature=0.0
+        ):
+            print(chunk, end="", flush=True)
+        print()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Test 6: Invoke with Tools (Retriever Tool Example)
+    print("\n--- Test 6: Invoke with Tools - Retriever Tool Example (Async) ---")
+    try:
+        user_prompt = "আমার এন আই ডি হারায়ে গেছে রাস্তায়, কি করব?"
+        print(f"Prompt: {user_prompt}")
+        messages = [{"role": "user", "content": user_prompt}]
+        final_response = await llm_service.invoke_with_tools(
+            messages=messages, tools=tools_list, available_tools=available_tools_map
+        )
+        print(f"\nFinal Model Response:\n{final_response}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    # Test 7: Stream with Tool Calls (Retriever Tool Example)
+    print("\n--- Test 7: Stream with Tool Calls - Retriever Tool Example (Async) ---")
+    try:
+        user_prompt = "THIS IS A GOVT SERVICE RELATED QUERY. MAKE SURE YOU ANSWER FROM KNOWLEDGEBASE. আমার এন আই ডি হারায়ে গেছে রাস্তায়, কি করব? "
+        print(f"Prompt: {user_prompt}\nStreaming Response:")
+        messages = [{"role": "user", "content": user_prompt}]
+        async for chunk in llm_service.stream_with_tool_calls(
+            messages=messages, tools=tools_list, available_tools=available_tools_map
+        ):
+            print(chunk, end="", flush=True)
+        print()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+            
+    print("\n--- All Asynchronous Tests Concluded ---")
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
+================================================================================
+--- File: cogops/models/embGemma_embedder.py ---
+================================================================================
+
+import json
+import logging
+from typing import Any, Dict, List
+import numpy as np
+import requests
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+from pydantic import BaseModel, Field
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+QUERY_PREFIX = "task: search result | query: "
+PASSAGE_PREFIX = "title: none | text: "
+
+class GemmaTritonEmbedderConfig(BaseModel):
+    """Configuration for the GemmaTritonEmbedder."""
+    triton_url: str = Field(description="Base URL for the Triton Inference Server")
+    triton_request_timeout: int = Field(default=480, description="Request timeout in seconds.")
+    model_name: str = Field(default="gemma_embedding", description="Name of the model in Triton.")
+    tokenizer_name: str = Field(default="onnx-community/embeddinggemma-300m-ONNX", description="HF tokenizer name.")
+    triton_output_name: str = Field(default="sentence_embedding", description="Name of the output tensor.")
+    batch_size: int = Field(default=8, description="Batch size for embedding requests sent to Triton.")
+
+class _SyncGemmaTritonEmbedder:
+    """Internal synchronous client that handles communication with Triton."""
+    def __init__(self, config: GemmaTritonEmbedderConfig):
+        self.config = config
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+
+    def _build_triton_payload(self, texts: List[str]) -> Dict[str, Any]:
+        """Prepares the request payload for Triton."""
+        tokens = self.tokenizer(texts, padding=True, truncation=True, max_length=2048, return_tensors="np")
+        input_ids = tokens["input_ids"].astype(np.int64)
+        attention_mask = tokens["attention_mask"].astype(np.int64)
+        payload = {
+            "inputs": [
+                {"name": "input_ids", "shape": list(input_ids.shape), "datatype": "INT64", "data": input_ids.flatten().tolist()},
+                {"name": "attention_mask", "shape": list(attention_mask.shape), "datatype": "INT64", "data": attention_mask.flatten().tolist()},
+            ],
+            "outputs": [{"name": self.config.triton_output_name}],
+        }
+        return payload
+
+    def _post_process(self, triton_output: Dict[str, Any]) -> List[List[float]]:
+        """Extracts the pooled embeddings from the Triton output."""
+        output_data = next((out for out in triton_output["outputs"] if out["name"] == self.config.triton_output_name), None)
+        if output_data is None:
+            raise ValueError(f"Output '{self.config.triton_output_name}' not in Triton response.")
+        
+        shape = output_data["shape"]
+        embeddings = np.array(output_data["data"], dtype=np.float32).reshape(shape)
+        return embeddings.tolist()
+
+    def embed(self, texts: List[str], model_name: str) -> List[List[float]]:
+        """Creates embeddings for a list of texts using a synchronous request."""
+        if not texts:
+            return []
+        api_url = f"{self.config.triton_url.rstrip('/')}/v2/models/{model_name}/infer"
+        payload = self._build_triton_payload(texts)
+        try:
+            response = requests.post(
+                api_url, 
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=self.config.triton_request_timeout
+            )
+            response.raise_for_status()
+            response_json = response.json()
+            return self._post_process(response_json)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error embedding texts with model {model_name}: {e}", exc_info=True)
+            raise
+
+class GemmaTritonEmbedder:
+    """A synchronous client for EmbeddingGemma on Triton with separate query and passage embedding via prefixes."""
+    def __init__(self, config: GemmaTritonEmbedderConfig):
+        self.config = config
+        self._client = _SyncGemmaTritonEmbedder(config)
+        logger.info(f"Embedder initialized for Triton at {config.triton_url} with batch size {config.batch_size}")
+
+    def embed_queries(self, texts: List[str]) -> List[List[float]]:
+        """Embeds a batch of queries using the query prefix."""
+        if not isinstance(texts, list) or not texts:
+            return []
+        texts_with_prefix = [QUERY_PREFIX + t for t in texts]
+        all_embeddings = []
+        for i in range(0, len(texts_with_prefix), self.config.batch_size):
+            batch = texts_with_prefix[i : i + self.config.batch_size]
+            logger.info(f"Sending query batch of {len(batch)} to Triton...")
+            batch_embeddings = self._client.embed(batch, self.config.model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    def embed_passages(self, texts: List[str]) -> List[List[float]]:
+        """Embeds a batch of documents/passages using the passage prefix."""
+        if not isinstance(texts, list) or not texts:
+            return []
+        texts_with_prefix = [PASSAGE_PREFIX + t for t in texts]
+        all_embeddings = []
+        for i in range(0, len(texts_with_prefix), self.config.batch_size):
+            batch = texts_with_prefix[i : i + self.config.batch_size]
+            logger.info(f"Sending passage batch of {len(batch)} to Triton...")
+            batch_embeddings = self._client.embed(batch, self.config.model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    def as_chroma_passage_embedder(self) -> EmbeddingFunction:
+        """Returns an object that conforms to ChromaDB's EmbeddingFunction protocol."""
+        class ChromaPassageEmbedder(EmbeddingFunction):
+            def __init__(self, client: 'GemmaTritonEmbedder'):
+                self._client = client
+            def __call__(self, input: Documents) -> Embeddings:
+                return self._client.embed_passages(input)
+        return ChromaPassageEmbedder(self)
+
+    def close(self):
+        logger.info("Closing embedder (no-op for synchronous requests version).")
+        pass
+
+================================================================================
+--- File: cogops/retriver/vector_search.py ---
+================================================================================
+
+import os
+import yaml
+import chromadb
+import logging
+import asyncio
+from collections import defaultdict
+from dotenv import load_dotenv
+from typing import List, Dict, Optional, Any, Tuple
+
+# --- Custom Module Imports ---
+# Adjust these paths based on your actual project structure
+from cogops.models.embGemma_embedder import GemmaTritonEmbedder, GemmaTritonEmbedderConfig
+from cogops.retriver.db import SQLDatabaseManager
+from cogops.utils.db_config import get_postgres_config
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Load Environment Variables ---
+load_dotenv()
+POSTGRES_CONFIG = get_postgres_config()
+
+class VectorRetriever:
+    """
+    Retrieves and ranks documents by first querying multiple vector collections in ChromaDB,
+    fusing the results using RRF to get the top passage IDs, and then fetching the
+    full passage content from a PostgreSQL database.
+    """
+    def __init__(self, config_path: str = "configs/config.yaml"):
+        logging.info("Initializing VectorRetriever...")
+        full_config = self._load_config(config_path)
+        retriever_config = full_config.get("vector_retriever")
+        if not retriever_config:
+            raise ValueError(f"Config file '{config_path}' is missing 'vector_retriever' section.")
+
+        # --- Load configuration ---
+        self.top_k = retriever_config.get("top_k", 10)
+        self.collection_names = retriever_config.get("collections", [])
+        self.max_passages_to_select = retriever_config.get("max_passages_to_select", 3)
+        self.rrf_k = retriever_config.get("rrf_k", 60)
+        self.passage_id_key = retriever_config.get("passage_id_meta_key", "passage_id")
+
+        if not self.collection_names:
+            raise ValueError("Config missing 'collections' key.")
+
+        # --- Initialize clients and embedder ---
+        self.chroma_client = self._connect_to_chroma()
+        self.db_manager = SQLDatabaseManager(POSTGRES_CONFIG)
+        self.embedder = self._initialize_embedder()
+
+        # Get handles to all required ChromaDB collections
+        self.collections = {
+            name: self.chroma_client.get_collection(name=name) for name in self.collection_names
+        }
+        logging.info(f"VectorRetriever initialized. Will select top {self.max_passages_to_select} passages after RRF.")
+
+    def _load_config(self, config_path: str) -> Dict:
+        logging.info(f"Loading configuration from: {config_path}")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"Configuration file not found at: {config_path}")
+            raise
+
+    def _connect_to_chroma(self) -> chromadb.HttpClient:
+        CHROMA_HOST = os.environ.get("CHROMA_DB_HOST", "localhost")
+        CHROMA_PORT = int(os.environ.get("CHROMA_DB_PORT", 8000))
+        logging.info(f"Connecting to ChromaDB at {CHROMA_HOST}:{CHROMA_PORT}...")
+        try:
+            client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+            client.heartbeat()
+            logging.info("✅ ChromaDB connection successful!")
+            return client
+        except Exception as e:
+            logging.error(f"Failed to connect to ChromaDB: {e}", exc_info=True)
+            raise
+
+    def _initialize_embedder(self) -> GemmaTritonEmbedder:
+        TRITON_URL = os.environ.get("TRITON_EMBEDDER_URL", "http://localhost:6000")
+        logging.info(f"Initializing GemmaTritonEmbedder with Triton at: {TRITON_URL}")
+        embedder_config = GemmaTritonEmbedderConfig(triton_url=TRITON_URL)
+        return GemmaTritonEmbedder(config=embedder_config)
+
+    async def _query_collection_async(
+        self,
+        collection_name: str,
+        query_embedding: List[float],
+        top_k: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Queries a single collection and returns a list of (passage_id, rank) tuples.
+        """
+        collection = self.collections[collection_name]
+        try:
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["metadatas"]
+            )
+            
+            ranked_results = []
+            if results and results['metadatas'] and results['metadatas'][0]:
+                for i, meta in enumerate(results['metadatas'][0]):
+                    passage_id_val = meta.get(self.passage_id_key)
+                    if passage_id_val is not None:
+                        try:
+                            passage_id = int(passage_id_val)
+                            rank = i + 1
+                            ranked_results.append((passage_id, rank))
+                        except (ValueError, TypeError):
+                            logging.warning(f"In collection '{collection_name}', could not convert passage_id '{passage_id_val}' to int. Skipping.")
+            return ranked_results
+        except Exception as e:
+            logging.error(f"Error querying {collection_name}: {e}")
+            return []
+
+    async def retrieve_passages(
+        self,
+        query: str,
+        top_k_per_collection: int = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Performs the end-to-end retrieval process.
+        
+        1. Embeds the query.
+        2. Queries all vector collections concurrently.
+        3. Fuses the results using RRF to rank passage IDs.
+        4. Selects the top N passage IDs.
+        5. Fetches the full passage data for these IDs from PostgreSQL.
+        
+        Returns:
+            A list of dictionaries, each containing passage details, ordered by RRF score.
+        """
+        if top_k_per_collection is None:
+            top_k_per_collection = self.top_k
+
+        logging.info(f"Starting retrieval for query: '{query}'")
+        
+        # Step 1: Embed the query
+        query_embedding = self.embedder.embed_queries([query])[0]
+
+        # Step 2: Query all collections in parallel
+        tasks = [
+            self._query_collection_async(name, query_embedding, top_k_per_collection)
+            for name in self.collection_names
+        ]
+        list_of_ranked_lists = await asyncio.gather(*tasks)
+
+        # Step 3: Apply Reciprocal Rank Fusion
+        fused_scores = defaultdict(float)
+        for ranked_list in list_of_ranked_lists:
+            for passage_id, rank in ranked_list:
+                fused_scores[passage_id] += 1.0 / (self.rrf_k + rank)
+        
+        if not fused_scores:
+            logging.warning("No passages found after querying all vector collections.")
+            return []
+
+        # Step 4: Sort by RRF score and select the top passage IDs
+        sorted_passage_ids = sorted(
+            fused_scores.keys(),
+            key=lambda pid: fused_scores[pid],
+            reverse=True
+        )
+        top_passage_ids = sorted_passage_ids[:self.max_passages_to_select]
+        logging.info(f"RRF found {len(fused_scores)} unique passages. Selecting top {len(top_passage_ids)} IDs for retrieval.")
+
+        if not top_passage_ids:
+            return []
+
+        # Step 5: Fetch full passage data from PostgreSQL
+        try:
+            logging.info(f"Fetching full data for IDs from PostgreSQL: {top_passage_ids}")
+            passages_df = self.db_manager.select_passages_by_ids(top_passage_ids)
+            
+            if passages_df.empty:
+                logging.warning(f"PostgreSQL query returned no data for IDs: {top_passage_ids}")
+                return []
+
+            # Convert DataFrame to a dictionary for efficient, ordered lookup
+            passage_map = {row['passage_id']: row.to_dict() for index, row in passages_df.iterrows()}
+
+            # Re-order the results from the database to match the RRF ranking
+            final_ordered_passages = []
+            for pid in top_passage_ids:
+                if pid in passage_map:
+                    final_ordered_passages.append(passage_map[pid])
+            
+            return final_ordered_passages
+
+        except Exception as e:
+            logging.error(f"Failed to retrieve passages from PostgreSQL. Error: {e}", exc_info=True)
+            return []
+
+    def close(self):
+        """Cleanly closes any open connections."""
+        if self.embedder:
+            self.embedder.close()
+            logging.info("Embedder connection closed.")
+
+async def main():
+    """Main function to test the VectorRetriever."""
+    retriever = None
+    try:
+        retriever = VectorRetriever(config_path="configs/config.yaml")
+        user_query = "আমার এন আই ডি হারায়ে গেছে রাস্তায়"
+        
+        print(f"\n--- Testing retrieval for query: '{user_query}' ---")
+        passages = await retriever.retrieve_passages(user_query)
+        
+        if passages:
+            print(f"\nRetrieved {len(passages)} passages from PostgreSQL, sorted by relevance:")
+            for i, passage in enumerate(passages):
+                print("-" * 20)
+                print(f"Rank {i+1}:")
+                print(f"  Passage ID: {passage.get('passage_id')}")
+                print(f"  URL: {passage.get('url')}")
+                print(f"  Date: {passage.get('date')}")
+                print(f"  Text: '{str(passage.get('text'))[:150]}...'")
+        else:
+            print("\nNo passages were retrieved for the query.")
+            
+    except Exception as e:
+        logging.error(f"An error occurred in the main execution: {e}", exc_info=True)
+    finally:
+        if retriever:
+            retriever.close()
+        logging.info("\n--- Script Finished ---")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+--- File: cogops/retriver/db.py ---
+================================================================================
+
+import sys
+import pandas as pd
+import numpy as np
+from loguru import logger
+import psycopg2
+from psycopg2.extensions import register_adapter, AsIs
+
+from sqlalchemy import (
+    create_engine,
+    select,
+    insert,
+    delete,
+    update,
+    Table,
+    Column,
+    Integer,
+    String,
+    Text,
+    Date,
+)
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+
+# --- Numpy Datatype Adapters for psycopg2 ---
+# Prevents errors when inserting numpy data types into PostgreSQL.
+def addapt_numpy_float64(numpy_float64):
+    return AsIs(numpy_float64)
+def addapt_numpy_int64(numpy_int64):
+    return AsIs(numpy_int64)
+
+register_adapter(np.float64, addapt_numpy_float64)
+register_adapter(np.int64, addapt_numpy_int64)
+
+
+# --- Declarative Base for ORM Models ---
+class Base(DeclarativeBase):
+    """Base class required for SQLAlchemy ORM models."""
+    pass
+
+
+# --- Passages Table Schema Definition ---
+class Passages(Base):
+    """
+    Defines the schema for the 'passages' table. This class is used by
+    SQLAlchemy to map to the database table structure.
+    """
+    __tablename__ = "passages"
+    passage_id = Column(Integer, nullable=False, primary_key=True)
+    topic = Column(String)
+    text = Column(Text, nullable=False)
+    date = Column(Date)
+
+    def __repr__(self) -> str:
+        return f"Passages(passage_id={self.passage_id!r}, topic={self.topic!r})"
+
+
+# --- Database Management Class ---
+class SQLDatabaseManager():
+    """
+    Manages the connection and CRUD operations for the 'passages' table
+    in an existing PostgreSQL database.
+    """
+    def __init__(self, database_config: dict) -> None:
+        """
+        Initializes the database manager and connects to the database.
+
+        Args:
+            database_config (dict): Connection parameters (user, password, host, port, database).
+        """
+        self.config = database_config
+        self.engine = self._create_engine()
+        self.passages_table = Passages.__table__
+
+    def _create_engine(self):
+        """Creates and returns a SQLAlchemy engine."""
+        try:
+            conn_url = 'postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}'.format(**self.config)
+            return create_engine(conn_url, echo=self.config.get('echo', False))
+        except Exception as exc:
+            logger.error(f"Could not create database engine: {exc}")
+            sys.exit(-1)
+
+    def insert_passages(self, insert_data: list[dict]) -> int:
+        """Inserts new rows into the passages table."""
+        if not insert_data:
+            return 0
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(insert(self.passages_table), insert_data)
+                conn.commit()
+            logger.info(f"Successfully inserted {len(insert_data)} passages.")
+            return 0
+        except Exception as exc:
+            logger.error(f"An error occurred during INSERT: {exc}")
+            sys.exit(-1)
+
+    def select_passages(self, condition_dict: dict = None) -> pd.DataFrame:
+        """Selects rows from the passages table based on conditions."""
+        stmt = select(self.passages_table)
+        if condition_dict:
+            stmt = stmt.where(*[
+                getattr(self.passages_table.c, col) == val for col, val in condition_dict.items()
+            ])
+        try:
+            with self.engine.connect() as conn:
+                return pd.read_sql(stmt, conn)
+        except Exception as exc:
+            logger.error(f"An error occurred during SELECT: {exc}")
+            sys.exit(-1)
+            
+    def select_passages_by_ids(self, passage_ids: list) -> pd.DataFrame:
+        """Selects passages from the table by a list of passage_ids."""
+        if not passage_ids:
+            return pd.DataFrame()
+        stmt = select(self.passages_table).where(self.passages_table.c.passage_id.in_(passage_ids))
+        try:
+            with self.engine.connect() as conn:
+                return pd.read_sql(stmt, conn)
+        except Exception as exc:
+            logger.error(f"An error occurred during SELECT_BY_IDS: {exc}")
+            sys.exit(-1)
+
+    def update_passages(self, condition_columns: list, update_array: list[dict]) -> int:
+        """Updates existing rows in the passages table."""
+        if not update_array:
+            return 0
+        try:
+            with self.engine.connect() as conn:
+                for item in update_array:
+                    conditions = {col: item[col] for col in condition_columns}
+                    values = {k: v for k, v in item.items() if k not in condition_columns}
+                    stmt = update(self.passages_table).where(
+                        *[getattr(self.passages_table.c, col) == val for col, val in conditions.items()]
+                    ).values(values)
+                    conn.execute(stmt)
+                conn.commit()
+            logger.info(f"Successfully processed {len(update_array)} update operations.")
+            return 0
+        except Exception as exc:
+            logger.error(f"An error occurred during UPDATE: {exc}")
+            sys.exit(-1)
+
+    def upsert_passages(self, insert_data: list[dict], update_columns: list[str]) -> int:
+        """Inserts new passages or updates them on primary key conflict (PostgreSQL specific)."""
+        if not insert_data:
+            return 0
+        try:
+            pk = [key.name for key in self.passages_table.primary_key]
+            stmt = pg_insert(self.passages_table).values(insert_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=pk,
+                set_={col: getattr(stmt.excluded, col) for col in update_columns}
+            )
+            with self.engine.connect() as conn:
+                conn.execute(stmt)
+                conn.commit()
+            logger.info(f"Successfully upserted {len(insert_data)} passages.")
+            return 0
+        except Exception as exc:
+            logger.error(f"An error occurred during UPSERT: {exc}")
+            sys.exit(-1)
+
+    def delete_passages(self, condition_dict: dict) -> int:
+        """Deletes rows from the passages table based on conditions."""
+        if not condition_dict:
+            logger.error("DELETE operation requires conditions but none were provided.")
+            return -1
+        stmt = delete(self.passages_table).where(*[
+            getattr(self.passages_table.c, col) == val for col, val in condition_dict.items()
+        ])
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(stmt)
+                conn.commit()
+            logger.info(f"DELETE operation affected {result.rowcount} rows.")
+            return 0
+        except Exception as exc:
+            logger.error(f"An error occurred during DELETE: {exc}")
+            sys.exit(-1)
+
+================================================================================
+--- File: cogops/utils/token_manager.py ---
+================================================================================
+
+# FILE: cogops/utils/token_manager.py
+
+import logging
+from transformers import AutoTokenizer
+from typing import List, Tuple, Dict, Any, Union
+from pydantic import BaseModel
+
+class TokenManager:
+    """
+    A utility class for managing token counts and truncating prompts to fit
+    within a model's context window.
+    """
+    def __init__(self, model_name: str, reservation_tokens: int, history_budget: float):
+        """
+        Initializes the tokenizer and configuration for prompt building.
+        """
+        logging.info(f"Initializing TokenManager with tokenizer from '{model_name}'...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.reservation_tokens = reservation_tokens
+        self.history_budget = history_budget
+        logging.info(f"✅ TokenManager initialized. Reservation: {reservation_tokens} tokens, History Budget: {history_budget*100}%.")
+
+    def count_tokens(self, text: str) -> int:
+        """Counts the number of tokens in a given string."""
+        if not text:
+            return 0
+        return len(self.tokenizer.encode(text))
+
+    def _truncate_history(self, history: List[Tuple[str, str]], max_tokens: int) -> str:
+        """
+        Truncates conversation history from oldest to newest to fit the token budget.
+        Returns a formatted string of the truncated history.
+        """
+        if not history:
+            return "No conversation history yet."
+            
+        truncated_history = list(history)
+        while truncated_history:
+            # The format here MUST match the one expected in the prompt
+            formatted_history = "\n---\n".join([f"User: {u}\nAssistant: {a}" for u, a in truncated_history])
+            if self.count_tokens(formatted_history) <= max_tokens:
+                return formatted_history
+            truncated_history.pop(0)
+        
+        return "History is too long to be included in this turn's context."
+
+    def _truncate_passages(self, passages: Union[List[Any], str], max_tokens: int) -> str:
+        # ... (This function remains unchanged from your provided file) ...
+        pass
+
+    def build_safe_prompt(self, template: str, max_tokens: int, **kwargs: Dict[str, Any]) -> str:
+        """
+        Builds a prompt from a template and components, ensuring it does not
+        exceed the maximum token limit through intelligent truncation.
+        """
+        available_content_tokens = max_tokens - self.reservation_tokens
+
+        tokens_used = 0
+        final_components = {}
+        # First, process all non-truncatable components
+        for key, value in kwargs.items():
+            if key not in ['history', 'passages_context']: # 'passages_context' is an example key
+                str_value = str(value)
+                final_components[key] = str_value
+                tokens_used += self.count_tokens(str_value)
+        
+        remaining_tokens = available_content_tokens - tokens_used
+        if remaining_tokens < 0:
+            logging.warning("Fixed components alone exceed token budget. Prompt will be truncated.")
+            remaining_tokens = 0
+
+        history_str = ""
+        # Process history with its budget
+        if 'history' in kwargs and kwargs['history']:
+            history_budget_tokens = int(remaining_tokens * self.history_budget)
+            history_str = self._truncate_history(kwargs['history'], history_budget_tokens)
+            tokens_used += self.count_tokens(history_str)
+        
+        # --- START OF FIX ---
+        # The key here MUST match the placeholder in the AGENT_PROMPT string.
+        final_components['conversation_history'] = history_str
+        # --- END OF FIX ---
+
+        # You can add similar logic for other dynamic, truncatable contexts here
+        # For example, if you had a 'documents' context:
+        # passage_tokens_budget = available_content_tokens - tokens_used
+        # passage_str = self._truncate_passages(kwargs.get('passages_context'), passage_tokens_budget)
+        # final_components['passages_context'] = passage_str
+
+        # Finally, format the template with the assembled components.
+        final_prompt = template.format(**final_components)
+        
+        # A final safety check in case formatting added extra tokens
+        if self.count_tokens(final_prompt) > max_tokens:
+            encoded_prompt = self.tokenizer.encode(final_prompt)
+            truncated_encoded = encoded_prompt[:max_tokens]
+            final_prompt = self.tokenizer.decode(truncated_encoded, skip_special_tokens=True)
+            logging.warning("Prompt exceeded budget after final assembly and was hard-truncated.")
+            
+        return final_prompt
+
+================================================================================
+--- File: cogops/utils/prompt.py ---
+================================================================================
+
+import json
+from typing import Type
+from pydantic import BaseModel
+
+def build_structured_prompt(prompt: str, response_model: Type[BaseModel]) -> str:
+    """
+    Constructs a standardized prompt for forcing a model to generate a
+    JSON object that conforms to a given Pydantic model's schema.
+    
+    Args:
+        prompt (str): The core user prompt or request.
+        response_model (Type[BaseModel]): The Pydantic model for the desired output.
+
+    Returns:
+        str: A fully formatted prompt ready for an LLM.
+    """
+    # Generate the JSON schema from the Pydantic model.
+    schema = json.dumps(response_model.model_json_schema(), indent=2)
+
+    # Engineer a new prompt that includes the original prompt and instructions.
+    structured_prompt = f"""
+    Given the following request:
+    ---
+    {prompt}
+    ---
+    Your task is to provide a response as a single, valid JSON object that strictly adheres to the following JSON Schema.
+    Do not include any extra text, explanations, or markdown formatting (like ```json) outside of the JSON object itself.
+
+    JSON Schema:
+    {schema}
+    """
+    return structured_prompt
+
+================================================================================
+--- File: cogops/utils/db_config.py ---
+================================================================================
+
+import os
+import sys
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load environment variables from a .env file
+load_dotenv()
+
+import os
+import sys
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load environment variables from a .env file in the current directory or parent directories
+load_dotenv()
+
+def get_postgres_config():
+    """
+    Loads PostgreSQL configuration from environment variables.
+    Exits the application if any required variable is missing.
+    """
+    # This mapping ensures the correct keys are created for the SQLAlchemy engine.
+    key_map = {
+        "POSTGRES_HOST": "host",
+        "POSTGRES_PORT": "port",
+        "POSTGRES_USER": "user",
+        "POSTGRES_PASSWORD": "password",
+        "POSTGRES_DB": "database",  # <-- This is the corrected key
+    }
+
+    config = {key: os.getenv(env_var) for env_var, key in key_map.items()}
+
+    # Validate that all required variables were found in the .env file
+    missing = [env_var for env_var, key in key_map.items() if not config[key]]
+    if missing:
+        logger.error(f"Missing required environment variables: {missing}")
+        sys.exit("Exiting: Database configuration is incomplete.")
+        
+    logger.info("PostgreSQL configuration loaded successfully.")
+    return config
+
+
+
+================================================================================
+--- File: cogops/utils/private_api.py ---
+================================================================================
+
+# FILE: cogops/utils/private_api.py (NEW FILE)
+
+import os
+import requests
+import logging
+from typing import Dict, Any, Optional
+
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+
+def make_private_request(endpoint: str, session_meta: Dict[str, Any], method: str = 'GET', payload: Optional[Dict] = None) -> Optional[Dict]:
+    """Handles authenticated requests by sending both access and refresh tokens in the headers."""
+    access_token = session_meta.get('access_token')
+    refresh_token = session_meta.get('refresh_token')
+
+    if not all([access_token, refresh_token]):
+        logging.error(f"Missing auth tokens for private API call to {endpoint}.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "refreshToken": refresh_token,
+        "Content-Type": "application/json"
+    }
+    api_url = f"{BASE_URL}/{endpoint}"
+    
+    try:
+        if method == 'GET':
+            response = requests.get(api_url, headers=headers, timeout=15)
+        elif method == 'POST':
+            response = requests.post(api_url, headers=headers, json=payload, timeout=15)
+        else:
+            return None
+            
+        response.raise_for_status()
+        return response.json()
+        
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"HTTP error for {endpoint}: {e} - {e.response.text}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed for {endpoint}: {e}")
+        return None
+
+================================================================================
+--- File: cogops/tools/tools.py ---
+================================================================================
+
+# FILE: cogops/tools/tools.py
+
+from typing import List, Dict, Any
+
+# --- Absolute imports for all tool functions ---
+from cogops.tools.custom.knowledge_retriever import retrieve_knowledge
+from cogops.tools.public.product_tools import get_product_details_as_markdown
+from cogops.tools.private.order_tools import get_user_order_profile_as_markdown
+
+# --- Available Tools Map ---
+# This dictionary maps the function name (the "key") to the actual Python function object (the "value").
+# The "key" MUST EXACTLY MATCH the 'name' field in the schemas below.
+available_tools_map = {
+    # Public & Custom Tools
+    "retrieve_knowledge": retrieve_knowledge,
+    "get_product_details_as_markdown": get_product_details_as_markdown,
+    
+    # Private, Context-Enrichment Tools (require a valid user session)
+    "get_user_order_profile_as_markdown": get_user_order_profile_as_markdown,
+}
+
+
+# --- OpenAI-Compatible Tools List (Schemas) ---
+# This list defines the schema for each tool. The LLM uses this to understand:
+# 1. What the tool does (from the description).
+# 2. What to call it (from the 'name' field, which links to the map above).
+# 3. What arguments it needs (from the parameters).
+tools_list = [
+    # ===================================================================
+    # CUSTOM & KNOWLEDGE TOOLS
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_knowledge",
+            "description": "Call this function to find answers in the official Bengal Meat knowledge base for all informational, non-product, and non-order questions. It retrieves relevant text passages to answer the user's query.\n\n*** USE THIS TOOL FOR QUESTIONS ABOUT ***\n1.  **Policies & Rules:** Return/Refund Policy, Privacy Policy, Terms and Conditions.\n2.  **How-To Guides:** How to place an order, track an order, use coupons, reset passwords.\n3.  **Product & Safety Info:** Food safety, Halal process, product details (e.g., 'what is a steak?'), sourcing.\n4.  **General Company Info:** Delivery times/charges, payment methods, customer care hours, business inquiries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user's full and specific question. Use the text from the user's prompt directly. EXAMPLES: 'ফেরত দেওয়ার নিয়ম কী?' (What is the return policy?), 'আমার অর্ডার ট্র্যাক করব কীভাবে?' (How do I track my order?)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ===================================================================
+    # PUBLIC PRODUCT TOOLS (Session-Aware)
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            # --- FIX 1: The 'name' now EXACTLY matches the key in available_tools_map ---
+            "name": "get_product_details_as_markdown",
+            "description": "Call this function to get ALL details for a SINGLE, SPECIFIC product. Use this when a user asks for more information about a product they are interested in.\n\n*** WHEN TO USE ***\n- The user asks for the price of a specific item, e.g., 'What is the price of Beef Bone In?'\n- The user asks if a specific item is in stock, e.g., 'Is Chinigura Rice available?'\n- The user asks for a description of a specific item, e.g., 'Tell me more about the Chicken Nuggets.'\n\n*** CRITICAL INSTRUCTION FOR FINDING THE 'slug' ***\nBefore calling this tool, you MUST find the product's unique `slug` from the `STORE_CATALOG` that is provided in your system prompt. Match the user's requested product name to the name in the catalog to find its corresponding slug. **Do not guess the slug.**\n\n*** WHAT IT RETURNS ***\n- A **Markdown formatted string** with a complete summary of the product, including price, stock status, description, and related product suggestions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "The unique URL-friendly identifier for the product, found in the STORE_CATALOG. Example: 'beef-back-leg-bone-in', 'paratha-20-pcs'."
+                    },
+                    "store_id": {
+                        "type": "integer",
+                        "description": "The unique numerical ID of the store where the user is shopping. This is mandatory."
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "The customer's unique ID. This is REQUIRED. If the user is not logged in, you MUST use the default guest ID, which is '369'."
+                    }
+                },
+                "required": ["slug", "store_id", "customer_id"]
+            }
+        }
+    },
+    
+    # ===================================================================
+    # PRIVATE, ORDER-RELATED TOOLS (FOR LOGGED-IN USERS)
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            # --- FIX 2: The 'name' now EXACTLY matches the key in available_tools_map ---
+            "name": "get_user_order_profile_as_markdown",
+            "description": "The main tool for answering ANY question about a logged-in user's past or current orders.\n\n*** WHEN TO USE ***\n\n1.  **For a Specific Order:** If the user provides an order number/code (e.g., 'What's the status of order 250814...?'), call this function and pass the code to the `order_code` parameter.\n\n2.  **For General History:** If the user asks a general question (e.g., 'Show my recent orders', 'What did I buy last time?'), call this function WITHOUT the `order_code` parameter.\n\n*** WHAT IT RETURNS ***\n- A **Markdown formatted string** summarizing the user's recent orders or detailing a specific one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_code": {
+                        "type": "string",
+                        "description": "Optional. The unique code of a specific order (e.g., '25081411552764833049'). Provide this ONLY when the user asks about one single order. For general history questions, OMIT this parameter."
+                    }
+                }
+            }
+        }
+    }
+]
+
+================================================================================
+--- File: cogops/tools/custom/knowledge_retriever.py ---
+================================================================================
+
+# tools.py
+# This script defines various tool functions that can be used by the LLM service.
+# Currently includes: get_current_time and retrieve_knowledge.
+# The VectorRetriever class is assumed to be in cogops.retriver.vector_search.
+# Also includes the OpenAI-compatible tools_list and available_tools_map for easy import.
+
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime
+from collections import defaultdict
+import yaml
+import chromadb
+from typing import List, Dict, Any, Tuple
+from dotenv import load_dotenv
+load_dotenv()
+# --- Custom Module Imports ---
+# Adjust these paths based on your actual project structure
+from cogops.retriver.vector_search import VectorRetriever  # Assuming this is where VectorRetriever is defined
+
+CONFIG_CONSTANT=os.getenv("CONFIG_FILE_PATH")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_current_time() -> str:
+    """Returns the current server date and time as a formatted string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+async def retrieve_knowledge(query: str) -> List[Dict[str, Any]]:
+    """Async tool function to retrieve passages from the knowledge base using VectorRetriever."""
+    retriever = VectorRetriever(config_path=CONFIG_CONSTANT)
+    try:
+        passages = await retriever.retrieve_passages(query)
+        return passages
+    except Exception as e:
+        logging.error(f"Error in retrieve_knowledge: {e}", exc_info=True)
+        return []
+    finally:
+        retriever.close()
+
+
+
+================================================================================
+--- File: cogops/tools/private/user_tools.py ---
+================================================================================
+
+# FILE: tools/private/user_tools.py
+
+import os
+import requests
+import logging
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+
+# --- CRITICAL: Import the function you want to reuse ---
+from cogops.tools.private.order_tools import get_user_order_profile_as_markdown
+from cogops.utils.private_api import make_private_request as _make_private_request
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# --- Original User Profile Function (from your file) ---
+def fetch_user_profile(session_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fetches the profile details of the logged-in user."""
+    user_id = session_meta.get('user_id')
+    if not user_id:
+        logging.warning("fetch_user_profile: Attempted to call without user_id. Skipping.")
+        return None
+
+    endpoint = f"customer/{user_id}"
+    logging.info(f"Fetching user profile for user_id: {user_id}")
+    data = _make_private_request(endpoint, session_meta, method='GET') # Explicitly GET
+    
+    if data and data.get('data'):
+        user_info = data['data'][0]
+        return {
+            "name": user_info.get("customer_name"), 
+            "email": user_info.get("email"),
+            "phone": user_info.get("phone"), 
+            "gender": user_info.get("gender"),
+        }
+        
+    logging.warning(f"Failed to fetch or parse profile for user_id: {user_id}")
+    return None
+
+
+# --- NEW MASTER ORCHESTRATOR FUNCTION ---
+
+def generate_full_user_context_markdown(session_meta: Dict[str, Any]) -> str:
+    """
+    Orchestrates calls to fetch user profile and order history, then combines
+    them into a single, comprehensive Markdown string for LLM context.
+    """
+    if not session_meta.get('user_id'):
+        return "# User Context\n\nError: No active user session provided. The user is not logged in."
+
+    logging.info(f"Generating full user context for user_id: {session_meta['user_id']}")
+    
+    markdown_lines = ["# User Context Summary"]
+
+    # --- 1. Get and format the User Profile section ---
+    markdown_lines.append("\n## User Details")
+    profile_data = fetch_user_profile(session_meta)
+    if profile_data:
+        markdown_lines.append(f"- **Name:** {profile_data.get('name', 'N/A')}")
+        markdown_lines.append(f"- **Email:** {profile_data.get('email', 'N/A')}")
+        markdown_lines.append(f"- **Phone:** {profile_data.get('phone', 'N/A')}")
+    else:
+        markdown_lines.append("- *User details could not be retrieved.*")
+
+    # --- 2. Reuse the order tool to get the complete, pre-formatted order history section ---
+    markdown_lines.append("\n## Recent Order Activity")
+    # This call directly returns a formatted Markdown string
+    order_history_markdown = get_user_order_profile_as_markdown(session_meta)
+    
+    # Clean up the redundant header from the reused function for a cleaner final output
+    # This makes the final document more seamless.
+    if "# User Order Profile" in order_history_markdown:
+        order_history_markdown = order_history_markdown.replace("# User Order Profile", "").strip()
+
+    markdown_lines.append(order_history_markdown)
+
+    return "\n".join(markdown_lines)
+
+
+
+
+================================================================================
+--- File: cogops/tools/private/order_tools.py ---
+================================================================================
+
+# FILE: tools/private/order_tools.py
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from datetime import datetime
+from cogops.utils.private_api import make_private_request as _make_private_request
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper to format dates cleanly ---
+def _format_date(date_string: Optional[str]) -> str:
+    if not date_string:
+        return "N/A"
+    try:
+        return datetime.fromisoformat(date_string.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+    except (ValueError, TypeError):
+        return date_string
+
+# --- NEW MASTER TOOL FUNCTION ---
+
+def get_user_order_profile_as_markdown(session_meta: Dict[str, Any], order_code: Optional[str] = None) -> str:
+    """
+    Fetches a user's order history and/or the details of a specific order,
+    then formats the output into a comprehensive and token-efficient Markdown string.
+
+    - If 'order_code' is provided, it fetches details for that specific order.
+    - If 'order_code' is omitted, it fetches a summary of the user's 3 most recent orders.
+    """
+    user_id = session_meta.get('user_id')
+    if not user_id:
+        return "Error: Cannot fetch order profile without a user session."
+
+    # --- Step 1: Always fetch the recent order history first ---
+    history_endpoint = "order-btoc/orderHistoryOrderData/0"
+    history_response = _make_private_request(history_endpoint, session_meta)
+
+    if not history_response or not history_response.get('data'):
+        return "# User Order Profile\n\nNo order history found for this user."
+
+    order_history = history_response['data']
+
+    # --- Scenario A: User asked for a SPECIFIC order ---
+    if order_code:
+        target_order_summary = next((order for order in order_history if order.get("order_code") == order_code), None)
+        if not target_order_summary:
+            return f"# Order Not Found\n\nCould not find an order with the code `{order_code}` in the user's recent history."
+
+        order_id = target_order_summary.get('id')
+        return _fetch_and_format_single_order(order_id, session_meta)
+
+    # --- Scenario B: User asked for a GENERAL history or for recommendations ---
+    else:
+        markdown_lines = ["# User Order Profile", "A summary of the user's most recent purchasing behavior."]
+        
+        # Limit to the 3 most recent orders to avoid being too slow or verbose
+        for order_summary in order_history[:3]:
+            order_id = order_summary.get('id')
+            if order_id:
+                # Fetch details for each order to get the product list
+                details_md = _fetch_and_format_single_order(order_id, session_meta, summary_mode=True)
+                markdown_lines.append("\n---\n" + details_md)
+        
+        return "\n".join(markdown_lines)
+
+
+def _fetch_and_format_single_order(order_id: int, session_meta: Dict[str, Any], summary_mode: bool = False) -> str:
+    """Internal helper to fetch and format one order's details into Markdown."""
+    endpoint = f"order-btoc/orderProductListFromOrderId/{order_id}"
+    data = _make_private_request(endpoint, session_meta)
+
+    if not data or not data.get('data'):
+        return f"### Order ID: {order_id}\n- Error: Could not retrieve details for this order."
+
+    order_info = data['data'].get('orderInfo', {})
+    products = data['data'].get('baseProductData', [])
+
+    if not order_info:
+        return f"### Order ID: {order_id}\n- Error: Missing order summary information."
+        
+    order_code = order_info.get('order_code', 'N/A')
+    order_date = _format_date(order_info.get('order_at'))
+    status = order_info.get('status', 'N/A')
+
+    # In summary mode, we use a more compact format
+    if summary_mode:
+        lines = [f"### Order `{order_code}` (Placed on: {order_date})"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Total:** {order_info.get('grand_total', 'N/A')} BDT")
+    else: # Full detail mode
+        lines = [f"# Details for Order `{order_code}`"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Order Date:** {order_date}")
+        lines.append(f"- **Payment Method:** {order_info.get('online_payment_method', 'N/A')}")
+        lines.append(f"- **Delivery Address:** {order_info.get('delivery_address_text', 'N/A')}")
+        lines.append(f"- **Subtotal:** {order_info.get('total', 'N/A')} BDT")
+        lines.append(f"- **Delivery Fee:** {order_info.get('delivery_charge', 'N/A')} BDT")
+        lines.append(f"- **Grand Total:** {order_info.get('grand_total', 'N/A')} BDT")
+
+    if products:
+        lines.append("- **Items in Order:**")
+        for prod in products:
+            lines.append(f"  - {prod.get('product_name', 'N/A')} (Qty: {prod.get('quantity', 0)})")
+    else:
+        lines.append("- No product information available for this order.")
+        
+    return "\n".join(lines)
+
+================================================================================
+--- File: cogops/tools/public/product_tools.py ---
+================================================================================
+
+# FILE: tools/public/product_tools.py
+
+import os
+import requests
+from bs4 import BeautifulSoup
+import logging
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+# Load environment variables from your .env file
+load_dotenv()
+
+# --- Configuration ---
+# This script requires the COMPANY_API_BASE_URL environment variable.
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _fetch_and_build_product_tree(store_id: int, customer_id: str) -> Dict[str, Any]:
+    """
+    Internal function to fetch product data and build a structured Python dictionary.
+    This is the shared logic for both Markdown and YAML formatters.
+    """
+    api_url = f"{BASE_URL}/product/productListForChatbot"
+    payload = {
+        "store_id": str(store_id), "company_id": 1, "order_by": "popularity", "customer_id": str(customer_id)
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=20)
+        response.raise_for_status()
+        product_list = response.json().get('data', {}).get(str(store_id), [])
+        if not product_list:
+            return {}
+
+        product_tree = {}
+        for product in product_list:
+            required_keys = ['parent_category_slug', 'parent_category_name', 'category_slug', 'category_name', 'product_slug', 'name']
+            if not all(product.get(key) for key in required_keys):
+                continue
+            
+            parent_slug = product['parent_category_slug']
+            if parent_slug not in product_tree:
+                product_tree[parent_slug] = {
+                    "name": product['parent_category_name'], "slug": parent_slug, "categories": {}
+                }
+            
+            cat_slug = product['category_slug']
+            if cat_slug not in product_tree[parent_slug]["categories"]:
+                product_tree[parent_slug]["categories"][cat_slug] = {
+                    "name": product['category_name'], "slug": cat_slug, "products": []
+                }
+            
+            product_tree[parent_slug]["categories"][cat_slug]["products"].append({
+                "name": product["name"], "slug": product["product_slug"]
+            })
+        
+        # Convert inner category dicts to lists
+        for parent_data in product_tree.values():
+            parent_data["categories"] = list(parent_data["categories"].values())
+
+        return {"store_name": product_list[0].get('store_name'), "tree": product_tree}
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed for store_id '{store_id}'. Error: {e}")
+        return {}
+    except (ValueError, KeyError) as e:
+        logging.error(f"Failed to parse API response for store_id '{store_id}'. Error: {e}")
+        return {}
+
+def get_product_catalog_as_markdown(store_id: int, customer_id: str) -> str:
+    """
+    Fetches the product catalog and formats it as a highly token-efficient 
+    and human-readable Markdown string. It uses the [Name](slug) syntax.
+
+    Returns:
+        A Markdown formatted string of the product catalog.
+    """
+    data = _fetch_and_build_product_tree(store_id, customer_id)
+    if not data or not data.get("tree"):
+        return "No products are currently available for this store."
+
+    product_tree = data["tree"]
+    store_name = data["store_name"]
+
+    markdown_lines = [f"# Product Catalog for {store_name}\n"]
+    for parent_data in product_tree.values():
+        # Parent Category: Level 2 Heading
+        markdown_lines.append(f"## [{parent_data['name']}]({parent_data['slug']})")
+        for category_data in parent_data['categories']:
+            # Category: Level 3 Heading
+            markdown_lines.append(f"  ### [{category_data['name']}]({category_data['slug']})")
+            for prod in category_data['products']:
+                # Product: List item
+                markdown_lines.append(f"    - [{prod['name']}]({prod['slug']})")
+        markdown_lines.append("") # Spacer
+
+    return "\n".join(markdown_lines)
+
+def get_product_details_as_markdown(slug: str, store_id: int, customer_id: int) -> str:
+    """
+    Retrieves exhaustive details for a single product using its slug and formats
+    the output into a token-efficient, LLM-friendly Markdown string.
+
+    Args:
+        slug: The URL-friendly slug of the product (e.g., 'beef-back-leg-bone-in').
+        store_id: The ID of the store for checking availability and details.
+        customer_id: The customer's ID. This is required (e.g., '369' for a guest).
+
+    Returns:
+        A detailed Markdown string about the product, or an error message string.
+    """
+    api_url = f"{BASE_URL}/product/getListOfProductDetails"
+    
+    logging.info(f"Requesting details for slug '{slug}' at store_id '{store_id}' for customer '{customer_id}'.")
+
+    payload = {
+        "slug": slug,
+        "store_id": str(store_id),
+        "customer_id": str(customer_id) # Ensure customer_id is a string for the JSON payload
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=15)
+        response.raise_for_status()
+        api_data = response.json().get('data', {})
+
+        product_data = api_data.get('productData')
+        if not product_data or not product_data[0]:
+            logging.warning(f"No details found for slug '{slug}' at store_id '{store_id}'.")
+            return f"Sorry, I could not find any details for a product with the identifier '{slug}'."
+
+        main_product = product_data[0]
+        markdown_lines = []
+
+        # --- Main Product Section ---
+        markdown_lines.append(f"# {main_product.get('name', 'Product Details')}")
+
+        # Price & Availability
+        markdown_lines.append("\n**Price & Availability**")
+        price_unit = f"{main_product.get('sale_uom', '')} {main_product.get('sal_uom_name', '')}".strip()
+        markdown_lines.append(f"- **Price:** {main_product.get('mrp', 'N/A')} BDT per {price_unit}")
+        
+        stock_qty = main_product.get('temp_quantity', 0)
+        markdown_lines.append(f"- **Availability:** {'In Stock' if stock_qty > 0 else 'Out of Stock'}")
+        
+        # Discount Information
+        discount_value = main_product.get('discount_value', 0)
+        if discount_value > 0:
+            # Now, determine the type of discount to format the string correctly.
+            if main_product.get('discount_type') == 'Amount':
+                # This handles fixed amount discounts.
+                markdown_lines.append(f"- **Current Offer:** {discount_value} TK off!")
+            else:
+                # This handles 'Percent' and any other potential discount types as a percentage.
+                markdown_lines.append(f"- **Current Offer:** {discount_value}% off!")
+
+        # Product Description
+        markdown_lines.append("\n**Description**")
+        details_html = main_product.get('details', 'No description available.')
+        cleaned_details = BeautifulSoup(details_html, "html.parser").get_text(separator='\n', strip=True)
+        markdown_lines.append(cleaned_details)
+
+        # Promotional Info
+        if main_product.get('meta_description'):
+            markdown_lines.append("\n**Good to Know**")
+            markdown_lines.append(f"> {main_product['meta_description']}")
+
+        # --- Related Products Section (Top 3) ---
+        related_products = api_data.get('relatedProducts', [])[:3]
+        if related_products:
+            markdown_lines.append("\n---\n\n## Frequently Bought Together")
+            for rel_prod in related_products:
+                markdown_lines.append(f"\n### {rel_prod.get('name', 'Related Product')}")
+                rel_price_unit = f"{rel_prod.get('sale_uom', '')} {rel_prod.get('sal_uom_name', '')}".strip()
+                rel_stock = "In Stock" if rel_prod.get('temp_quantity', 0) > 0 else "Out of Stock"
+                markdown_lines.append(f"- **Price:** {rel_prod.get('mrp')} BDT per {rel_price_unit}")
+                markdown_lines.append(f"- **Availability:** {rel_stock}")
+                markdown_lines.append(f"- **Identifier:** `{rel_prod.get('slug')}`")
+
+        return "\n".join(markdown_lines)
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed for product slug '{slug}'. Error: {e}")
+        return "Sorry, I'm having trouble connecting to the product server right now."
+    except (KeyError, IndexError) as e:
+        logging.error(f"Failed to parse the API response for slug '{slug}'. Missing key: {e}")
+        return "Sorry, I received an unexpected response from the server."
+
+================================================================================
+--- File: cogops/tools/public/promotions_tools.py ---
+================================================================================
+
+# FILE: tools/public/promotions_tools.py
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+# Load environment variables from your .env file
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# This is the default/fallback ID for guest users.
+GUEST_CUSTOMER_ID = 369
+
+
+# --- REFINED FUNCTION ---
+def get_active_promotions(store_id: int, session_meta: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Gets a list of all currently active promotions for a specific store.
+    It uses the customer_id from session_meta if available for potentially personalized promotions.
+    Use this when a user asks about offers, discounts, or current deals.
+
+    Args:
+        store_id: The ID of the store to check for promotions.
+        session_meta: The user's session data, which may contain a 'user_id'.
+    """
+    # Dynamically select customer_id: use real ID if logged in, otherwise fallback to guest ID.
+    customer_id_to_use = session_meta.get('user_id') or GUEST_CUSTOMER_ID
+
+    api_url = f"{BASE_URL}/data-driven-promotion/activePromotionList/Web/{store_id}/{customer_id_to_use}"
+    logging.info(f"Requesting active promotions for store_id '{store_id}' and customer_id '{customer_id_to_use}' from: {api_url}")
+
+    try:
+        response = requests.get(api_url, timeout=15)
+        response.raise_for_status()
+
+        promotions_data = response.json().get('validPromotionData', [])
+
+        simplified_promotions = [
+            {
+                "promotion_name": promo.get("name"),
+                "description": promo.get("description"),
+                "validity_start_date": promo.get("start_date"),
+                "validity_end_date": promo.get("end_date")
+            }
+            for promo in promotions_data
+        ]
+
+        logging.info(f"Successfully retrieved {len(simplified_promotions)} active promotions.")
+        return simplified_promotions
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch active promotions. Error: {e}")
+        return []
+
+
+
+
+================================================================================
+--- File: cogops/tools/public/location_tools.py ---
+================================================================================
+
+# FILE: tools/public/location_tools.py (or a new utility file)
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any
+from collections import defaultdict
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL", "https://api.bengalmeat.com") # Provide a default
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Existing API Call Functions (keep them as they are) ---
+
+def get_all_store_locations() -> List[Dict[str, Any]]:
+    """Fetches a list of all physical Bengal Meat stores."""
+    api_url = f"{BASE_URL}/store/storelistopen/1?is_visible=1"
+    try:
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('data', [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch store locations: {e}")
+        return []
+
+def get_operational_cities() -> List[str]:
+    """Returns a list of all cities where Bengal Meat operates."""
+    api_url = f"{BASE_URL}/customer/city"
+    try:
+        response = requests.post(api_url, timeout=10)
+        response.raise_for_status()
+        cities_data = response.json().get('data', {}).get('data', [])
+        return [city['name'] for city in cities_data if 'name' in city]
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch operational cities: {e}")
+        return []
+
+def get_all_delivery_areas() -> List[Dict[str, Any]]:
+    """Fetches a list of all specific delivery areas."""
+    api_url = f"{BASE_URL}/polygon/areaByCity/"
+    try:
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('data', [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch delivery areas: {e}")
+        return []
+
+# --- NEW MASTER FUNCTION ---
+
+def generate_location_and_delivery_markdown() -> str:
+    """
+    Fetches data from all location-related APIs and combines it into a single,
+    comprehensive, and LLM-friendly Markdown document.
+
+    This is designed to be run periodically to generate a static context file.
+    """
+    logging.info("Starting generation of the master location Markdown document...")
+
+    # 1. Fetch all necessary data from the APIs
+    stores = get_all_store_locations()
+    areas = get_all_delivery_areas()
+
+    if not stores:
+        return "# Location Information\n\nSorry, could not retrieve store location information at this time."
+
+    # 2. Process and structure the data
+    # Group stores by city
+    stores_by_city = defaultdict(list)
+    for store in stores:
+        # Filter out test stores or stores without a city
+        if "test" in store.get("name", "").lower() or not store.get("CITY"):
+            continue
+        stores_by_city[store["CITY"]].append(store)
+
+    # Map delivery areas to their respective stores for easy lookup
+    areas_by_store_id = defaultdict(list)
+    for area in areas:
+        if area.get("storeId") and area.get("name"):
+            areas_by_store_id[area["storeId"]].append(area["name"])
+
+    # 3. Build the Markdown String
+    markdown_lines = ["# Bengal Meat Store Locations & Delivery Areas"]
+    markdown_lines.append("This document contains all operational cities, physical store details, and specific delivery areas.")
+
+    # Sort cities for consistent output
+    sorted_cities = sorted(stores_by_city.keys())
+
+    for city in sorted_cities:
+        markdown_lines.append(f"\n## City: {city}")
+        
+        # Sort stores within the city by name
+        sorted_stores = sorted(stores_by_city[city], key=lambda s: s['name'])
+        
+        for store in sorted_stores:
+            store_id = store['id']
+            markdown_lines.append(f"\n### {store.get('name', 'N/A')}")
+            markdown_lines.append(f"- **Store ID:** {store_id}")
+            markdown_lines.append(f"- **Address:** {store.get('address', 'N/A').strip()}")
+            markdown_lines.append(f"- **Phone:** {store.get('contact_person_phone', 'N/A')}")
+            
+            # Add the list of delivery areas for this store
+            delivery_areas = sorted(areas_by_store_id.get(store_id, []))
+            if delivery_areas:
+                markdown_lines.append("- **Delivery Areas Covered:**")
+                for area in delivery_areas:
+                    markdown_lines.append(f"  - {area}")
+
+    logging.info("Successfully generated the master location Markdown document.")
+    return "\n".join(markdown_lines)
+
+================================================================================
+--- File: ingestion/ingest_data.py ---
+================================================================================
+
+import os
+import yaml
+import argparse
+import json
+from datetime import datetime
+from loguru import logger
+import sys
+from dotenv import load_dotenv
+from tqdm import tqdm
+import chromadb
+
+# --- Custom Module Imports ---
+# Ensure these paths are correct for your project structure
+from cogops.retriver.db import SQLDatabaseManager
+from cogops.utils.db_config import get_postgres_config
+from cogops.models.embGemma_embedder import GemmaTritonEmbedder, GemmaTritonEmbedderConfig
+
+# Load environment variables from .env file
+load_dotenv()
+
+# --- Infrastructure Configuration (from Environment Variables) ---
+TRITON_URL = os.environ.get("TRITON_EMBEDDER_URL", "http://localhost:6000")
+CHROMA_HOST = os.environ.get("CHROMA_DB_HOST", "localhost")
+CHROMA_PORT = int(os.environ.get("CHROMA_DB_PORT", 8443))
+POSTGRES_CONFIG = get_postgres_config()
+
+def load_agent_config(config_path: str) -> dict:
+    """Loads the agent's YAML configuration file."""
+    logger.info(f"Loading agent configuration from: {config_path}")
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        logger.info("Agent configuration loaded successfully.")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found at: {config_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error loading YAML configuration: {e}")
+        sys.exit(1)
+
+def load_json_files(json_folder_path: str) -> list:
+    """Loads all JSON files from a directory."""
+    if not os.path.isdir(json_folder_path):
+        logger.error(f"JSON folder not found at: {json_folder_path}")
+        sys.exit(1)
+        
+    all_json_data = []
+    logger.info(f"Loading JSON files from '{json_folder_path}'...")
+    file_list = [f for f in os.listdir(json_folder_path) if f.endswith('.json')]
+    
+    for filename in tqdm(file_list, desc="Reading JSON files"):
+        filepath = os.path.join(json_folder_path, filename)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                all_json_data.append(json.load(f))
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse JSON from {filename}. Skipping.")
+        except Exception as e:
+            logger.error(f"Failed to read {filename}: {e}")
+            
+    logger.info(f"Successfully loaded {len(all_json_data)} JSON files.")
+    return all_json_data
+
+def ingest_to_postgres(db_manager: SQLDatabaseManager, all_json_data: list):
+    """Prepares and upserts structured data into PostgreSQL."""
+    logger.info("--- Starting PostgreSQL Ingestion ---")
+    
+    postgres_records = []
+    # These are the columns for the 'passages' table
+    postgres_columns = ['passage_id', 'topic', 'text','date']
+
+    for data in all_json_data:
+        # Create a record with only the keys relevant to PostgreSQL
+        record = {key: data.get(key) for key in postgres_columns}
+        # Ensure date is in the correct format if it's a string
+        if isinstance(record['date'], str):
+            record['date'] = datetime.fromisoformat(record['date']).date()
+        postgres_records.append(record)
+
+    if not postgres_records:
+        logger.warning("No records to insert into PostgreSQL. Skipping.")
+        return
+
+    # All columns except the primary key should be updated on conflict
+    update_columns = [col for col in postgres_columns if col != 'passage_id']
+    
+    logger.info(f"Upserting {len(postgres_records)} records into the 'passages' table...")
+    db_manager.upsert_passages(insert_data=postgres_records, update_columns=update_columns)
+    logger.info("✅ PostgreSQL ingestion complete.")
+
+
+def ingest_to_chroma(chroma_client: chromadb.Client, embedder: GemmaTritonEmbedder, config: dict, all_json_data: list):
+    """Prepares, embeds, and ingests data into multiple ChromaDB collections."""
+    logger.info("--- Starting ChromaDB Ingestion ---")
+
+    # Mapping from config collection name to the key in our JSON files
+    collection_key_map = {
+        "PropositionsDB": "propositions",
+        "SummariesDB": "summaries",
+        "QuestionsDB": "question_patterns"
+    }
+
+    collections_to_process = config['vector_retriever']['collections']
+    passage_id_meta_key = config['vector_retriever']['passage_id_meta_key']
+    passage_embedding_function = embedder.as_chroma_passage_embedder()
+
+    for collection_name in collections_to_process:
+        json_key = collection_key_map.get(collection_name)
+        if not json_key:
+            logger.warning(f"No mapping found for collection '{collection_name}'. Skipping.")
+            continue
+
+        logger.info(f"\nProcessing collection: '{collection_name}'")
+
+        # 1. Clear the collection for a fresh start
+        try:
+            chroma_client.delete_collection(name=collection_name)
+            logger.info(f"Successfully deleted existing collection '{collection_name}'.")
+        except Exception:
+            logger.info(f"Collection '{collection_name}' does not exist. A new one will be created.")
+
+        # 2. Create the collection with our custom embedder
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=passage_embedding_function
+        )
+        
+        # 3. Prepare data from all JSON files for this collection
+        documents, metadatas, ids = [], [], []
+        for data in all_json_data:
+            passage_id = data['passage_id']
+            doc_list = data.get(json_key, [])
+            for i, doc_text in enumerate(doc_list):
+                documents.append(doc_text)
+                metadatas.append({passage_id_meta_key: passage_id})
+                ids.append(f"{collection_name}_{passage_id}_{i}")
+
+        if not documents:
+            logger.warning(f"No documents found for collection '{collection_name}'. Skipping ingestion.")
+            continue
+
+        # 4. Ingest data in batches
+        batch_size = 8  # A sensible default batch size
+        for i in tqdm(range(0, len(documents), batch_size), desc=f"Ingesting to {collection_name}"):
+            collection.add(
+                documents=documents[i:i + batch_size],
+                metadatas=metadatas[i:i + batch_size],
+                ids=ids[i:i + batch_size]
+            )
+        
+        logger.info(f"✅ Successfully ingested {collection.count()} documents into '{collection_name}'.")
+
+
+def main():
+    """Main function to orchestrate the entire ingestion pipeline."""
+    parser = argparse.ArgumentParser(description="Ingest processed data into PostgreSQL and ChromaDB.")
+    parser.add_argument("--config", type=str, required=True, help="Path to the agent's config.yaml file.")
+    parser.add_argument("--json_folder", type=str, required=True, help="Path to the folder with processed JSON files.")
+    args = parser.parse_args()
+
+    # --- Initialization ---
+    config = load_agent_config(args.config)
+    all_json_data = load_json_files(args.json_folder)
+
+    if not all_json_data:
+        logger.error("No JSON data loaded. Exiting.")
+        sys.exit(1)
+
+    db_manager = SQLDatabaseManager(POSTGRES_CONFIG)
+    
+    logger.info(f"Initializing embedder with Triton at: {TRITON_URL}")
+    embedder_config = GemmaTritonEmbedderConfig(triton_url=TRITON_URL)
+    embedder = GemmaTritonEmbedder(config=embedder_config)
+
+    logger.info(f"Connecting to ChromaDB at {CHROMA_HOST}:{CHROMA_PORT}")
+    chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+
+    try:
+        # --- Run Ingestion Pipelines ---
+        ingest_to_postgres(db_manager, all_json_data)
+        ingest_to_chroma(chroma_client, embedder, config, all_json_data)
+    except Exception as e:
+        logger.error(f"A critical error occurred during the ingestion process: {e}", exc_info=True)
+    finally:
+        embedder.close()
+        logger.info("\n--- Data Ingestion Script Finished ---")
+
+if __name__ == "__main__":
+    main()
+

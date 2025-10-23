@@ -10,13 +10,19 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
+# Core application components
 from cogops.agent import ChatAgent
 from fastapi.middleware.cors import CORSMiddleware
+# NEW: Import the context manager to handle static data loading
+from cogops.context_manager import context_manager
 
 # --- Global Configuration ---
 AGENT_CONFIG_PATH = "configs/config.yaml"
+# Define a default store/customer for the initial context build at startup
+DEFAULT_STORE_ID = 37 # e.g., Mohammadpur store is a good default
+GUEST_CUSTOMER_ID = "369"
 
-# --- Add Logging Configuration ---
+# --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- API Setup ---
@@ -37,6 +43,18 @@ app.add_middleware(
 # This dictionary maps a unique session_id (UUID) to a ChatAgent instance.
 chat_sessions: Dict[str, ChatAgent] = {}
 sessions_lock = asyncio.Lock()
+
+# --- NEW: Add a startup event handler ---
+@app.on_event("startup")
+async def startup_event():
+    """
+    On application startup, this function builds the static context (locations, catalog)
+    that will be shared across all user sessions. This is done only once to improve performance.
+    """
+    logging.info("Application startup: Building static context...")
+    # The context_manager will call the necessary APIs and store the results in memory.
+    context_manager.build_static_context(store_id=DEFAULT_STORE_ID, customer_id=GUEST_CUSTOMER_ID)
+    logging.info("Application is ready to accept requests.")
 
 
 # --- Pydantic Models for Requests ---
@@ -93,18 +111,22 @@ async def stream_chat(chat_request: ChatRequest):
             logging.info(f"-> Creating new session {new_session_id} with meta: {chat_request.session_meta}")
             
             async with sessions_lock:
-                # Instantiate the agent with the session metadata
-                session = ChatAgent(config_path=AGENT_CONFIG_PATH, session_meta=chat_request.session_meta)
+                # Instantiate the agent, passing the pre-built static context from the manager.
+                session = ChatAgent(
+                    config_path=AGENT_CONFIG_PATH,
+                    session_meta=chat_request.session_meta,
+                    location_context=context_manager.location_context,
+                    store_catalog=context_manager.store_catalog
+                )
                 chat_sessions[new_session_id] = session
             
-            # Autonomously fetch user context before generating any message.
-            # This populates the agent with user-specific info if they are logged in.
+            # Autonomously fetch user-specific context (profile, orders) if logged in.
             await session._enrich_context()
 
-            # The VERY FIRST message must be the new session_id for the frontend
+            # The VERY FIRST message must be the new session_id for the frontend.
             yield f'{json.dumps({"type": "session_id", "id": new_session_id})}\n'
             
-            # Now, stream the (potentially personalized) welcome message
+            # Now, stream the (potentially personalized) welcome message.
             async for event in session.generate_welcome_message():
                 yield f"{json.dumps(event, ensure_ascii=False)}\n"
             return # End the stream after the welcome message
@@ -112,7 +134,7 @@ async def stream_chat(chat_request: ChatRequest):
         # --- Case 2: Subsequent Request (Continue Existing Session) ---
         elif chat_request.session_id:
             if not chat_request.query:
-                error_event = {"type": "error", "content": "query is missing for an existing session."}
+                error_event = {"type": "error", "content": "Query is missing for an existing session."}
                 yield f'{json.dumps(error_event)}\n'
                 logging.warning(f"Invalid request for session {chat_request.session_id}: Query was missing.")
                 return
@@ -126,7 +148,7 @@ async def stream_chat(chat_request: ChatRequest):
                 logging.error(f"Request failed for invalid session_id: {chat_request.session_id}")
                 return
             
-            # Process the user's query and stream the response
+            # Process the user's query and stream the response.
             async for event in session.process_query(chat_request.query):
                 yield f"{json.dumps(event, ensure_ascii=False)}\n"
         

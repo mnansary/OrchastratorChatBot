@@ -1,108 +1,208 @@
-# app.py
+# FILE: streamlit_app.py
 
-import gradio as gr
-import requests # To make HTTP requests to your API
-import json     # To parse the streaming response from your API
-import uuid     # To create a unique session ID for the conversation
+import streamlit as st
+import requests
+import json
+import time
 
-# --- 1. API and Session Configuration ---
-# The Gradio client only needs to know the address of the API Gateway.
-# All backend logic is now handled by the separate govtchat service.
+# --- Configuration ---
+API_BASE_URL = "http://localhost:9000"
+CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
+LOGIN_API_URL = "https://api.bengalmeat.com/auth/customer-login"
 
-# IMPORTANT: Make sure this URL points to your running API Gateway.
-GATEWAY_URL = "http://114.130.116.74" 
-CHAT_API_ENDPOINT = f"{GATEWAY_URL}/govtchat/chat/stream"
-
-# Create a single, unique session ID for the entire duration of this Gradio app instance.
-# The backend service will use this to keep track of the conversation history.
-SESSION_ID = f"gradio-session-{uuid.uuid4()}"
-print(f"Gradio App is running. All conversations will use Session ID: {SESSION_ID}")
-
-
-# --- 2. Define the Core Chatbot Function (API Client) ---
-# This function is the bridge between Gradio's UI and our backend API.
-# It remains unchanged as its logic is independent of the display language.
-def predict(message: str, history: list):
-    """
-    The main prediction function that calls the backend chat API.
-
-    Args:
-        message (str): The user's input message from the Gradio UI.
-        history (list): The chat history managed by Gradio (we ignore this and rely on the backend's session).
-
-    Yields:
-        str: A stream of strings that builds the chatbot's response in the UI.
-    """
-    
-    # Immediately yield a "Thinking..." placeholder for better user experience.
-    yield "⌛ প্রক্রিয়াকরণ চলছে..." # Changed to Bangla
-
-    # This list will accumulate the full response as it's streamed from the API.
-    full_answer_list = []
-    
-    # This is the data we will send in our POST request to the backend.
-    payload = {
-        "user_id": SESSION_ID,
-        "query": message
-    }
-
-    try:
-        # Make a POST request to the streaming API endpoint.
-        with requests.post(CHAT_API_ENDPOINT, json=payload, stream=True, timeout=300) as response:
-            # Raise an exception if the API returns an error status code (e.g., 404, 500).
-            response.raise_for_status()
-            
-            # Iterate over the streaming response line by line.
-            for line in response.iter_lines():
-                if line:
-                    # Each line from the service is a JSON object representing an event.
-                    event = json.loads(line.decode('utf-8'))
-                    
-                    if event["type"] == "answer_chunk":
-                        # Append the new piece of the answer to our list.
-                        full_answer_list.append(event["content"])
-                        # Yield the joined list to update the Gradio UI in real-time.
-                        yield "".join(full_answer_list)
-                    
-                    elif event["type"] == "final_data":
-                        # The API signals that the main answer is complete and sends sources.
-                        sources = event["content"].get("sources", [])
-                        if sources:
-                            # Format the sources and append them to the final answer.
-                            source_str = "\n\n---\n*তথ্যসূত্র:* " + ", ".join(sources) # Changed to Bangla
-                            full_answer_list.append(source_str)
-                            # Yield the final, complete message with sources.
-                            yield "".join(full_answer_list)
-
-                    elif event["type"] == "error":
-                        # If the backend sends a specific error event, display it.
-                        yield f"ত্রুটি দেখা দিয়েছে: {event['content']}" # Changed to Bangla
-                        return # Stop processing on error
-
-    except requests.exceptions.RequestException as e:
-        # Catch network-related errors (e.g., cannot connect to the server).
-        print(f"An API connection error occurred: {e}")
-        yield f"দুঃখিত, আমি চ্যাট সার্ভিসের সাথে সংযোগ স্থাপন করতে পারিনি। অনুগ্রহ করে নিশ্চিত করুন যে ব্যাকএন্ড চলছে। ত্রুটি: {e}"
-    except Exception as e:
-        # Catch any other unexpected errors.
-        print(f"An unexpected error occurred in the predict function: {e}")
-        yield "একটি অপ্রত্যাশিত ত্রুটি ঘটেছে। আবার চেষ্টা করুন."
-
-
-# --- 3. Configure and Launch the Gradio UI ---
-# This section has been updated with the new Bangla titles and examples.
-demo = gr.ChatInterface(
-    fn=predict,
-    title="বাংলা VPA - আপনার ভার্চুয়াল সহায়ক",
-    description="সরকারি সেবা সম্পর্কে জিজ্ঞাসা করুন, এবং আমি আপনাকে সঠিক তথ্য দিয়ে সহায়তা করব।",
-    examples=[
-        ["জন্ম নিবন্ধন করার প্রক্রিয়া কি?"],
-        ["ট্রেড লাইসেন্স কিভাবে পাবো?"],
-        ["পাসপোর্ট করার জন্য কি কি কাগজপত্র প্রয়োজন?"]
-    ],
-    cache_examples=False,
+# --- Page Setup ---
+st.set_page_config(
+    page_title="Bengal Meat Assistant",
+    page_icon="🥩",
+    layout="centered"
 )
 
-if __name__ == "__main__":
-    # Launch the Gradio app. It will be accessible on your local network.
-    demo.launch(server_name="0.0.0.0")
+# --- Helper Functions ---
+
+@st.cache_data(ttl=3600)
+def fetch_stores() -> dict:
+    """Fetches store locations from the public company API."""
+    try:
+        response = requests.get("https://api.bengalmeat.com/store/storelistopen/1?is_visible=1")
+        response.raise_for_status()
+        stores = response.json().get('data', [])
+        # Filter out any test stores
+        return {
+            f"{store['name']} ({store.get('CITY', 'N/A')})": store['id'] 
+            for store in stores if "test" not in store.get("name", "").lower()
+        }
+    except Exception as e:
+        st.error(f"Could not fetch store list. Using fallback. Error: {e}")
+        return {"Mohammadpur Butcher Shop": 37, "Gulshan-2 GB": 67} # Sensible fallback
+
+def reset_session():
+    """Clears the session state to start a new chat."""
+    keys_to_clear = [key for key in st.session_state.keys() if key != 'stores']
+    for key in keys_to_clear:
+        del st.session_state[key]
+    # Re-initialize essential state
+    st.session_state.stage = "setup"
+    st.session_state.messages = []
+    st.session_state.session_id = None
+    st.rerun()
+
+# --- UI Sections ---
+
+def render_setup_page():
+    """Renders the initial screen for store selection and login."""
+    st.image("https://bengalmeat.com/wp-content/uploads/2023/11/logo.png", width=200)
+    st.title("Welcome to Bengal Meat's Chat Assistant!")
+    st.markdown("Please select your nearest store and log in to begin.")
+
+    if 'stores' not in st.session_state:
+        st.session_state.stores = fetch_stores()
+
+    selected_store_name = st.selectbox(
+        "Choose your store",
+        options=list(st.session_state.stores.keys()),
+        key="selected_store_name"
+    )
+    
+    login_tab, guest_tab = st.tabs(["Login", "Continue as Guest"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            login_button = st.form_submit_button("Login and Start Chat")
+
+            if login_button:
+                store_id = st.session_state.stores[selected_store_name]
+                with st.spinner("Logging in and preparing your personalized session..."):
+                    try:
+                        response = requests.post(LOGIN_API_URL, json={"email": email, "password": password})
+                        response.raise_for_status()
+                        login_data = response.json()
+                        
+                        # Use .get() for safer dictionary access
+                        if login_data.get("statusCode") == 201 and login_data.get("data"):
+                            user_data = login_data["data"].get("user", {})
+                            st.session_state.session_meta = {
+                                "store_id": store_id,
+                                "user_id": user_data.get("id"),
+                                "access_token": login_data["data"].get("accessToken"),
+                                "refresh_token": login_data["data"].get("refreshToken"),
+                            }
+                            st.session_state.stage = 'chat'
+                            st.rerun() # --- CHANGE: Automatically transition to chat ---
+                        else:
+                            st.error(f"Login failed: {login_data.get('message', 'Unknown error')}")
+                    except requests.RequestException as e:
+                        st.error(f"Login connection failed. Please check the server. Error: {e}")
+
+    with guest_tab:
+        if st.button("Continue as Guest and Start Chat"):
+            store_id = st.session_state.stores[selected_store_name]
+            st.session_state.session_meta = {
+                "store_id": store_id,
+                "user_id": None, "access_token": None, "refresh_token": None
+            }
+            st.session_state.stage = 'chat'
+            st.rerun() # --- CHANGE: Automatically transition to chat ---
+
+def render_chat_page():
+    """Renders the main chat interface and handles API communication."""
+    st.title("🥩 Chat with Meaty")
+    st.button("End Session & Start Over", on_click=reset_session)
+    st.markdown("---")
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Handle chat input from the user
+    if prompt := st.chat_input("Ask about products, offers, or your orders..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Prepare request payload for an existing session
+        payload = {"query": prompt, "session_id": st.session_state.session_id}
+        
+        # Display streaming response
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            tool_call_in_progress = False
+            
+            try:
+                with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if line:
+                            event = json.loads(line.decode('utf-8'))
+                            
+                            # --- CHANGE: Handle different event types from the backend ---
+                            event_type = event.get("type")
+                            
+                            if event_type == "tool_call":
+                                tool_name = event.get("tool_name", "a tool")
+                                placeholder.markdown(f"*(Searching for information using {tool_name}...)*")
+                                tool_call_in_progress = True
+                                
+                            elif event_type == "answer_chunk":
+                                if tool_call_in_progress:
+                                    # Clear the "thinking" message when the first text chunk arrives
+                                    full_response = ""
+                                    tool_call_in_progress = False
+                                
+                                full_response += event["content"]
+                                placeholder.markdown(full_response + "▌")
+                                
+                            elif event_type == "error":
+                                st.error(event.get('content', 'An unknown error occurred.'))
+                                break
+                
+                placeholder.markdown(full_response)
+            except requests.RequestException as e:
+                st.error(f"Failed to get response from chat service: {e}")
+                full_response = "Sorry, I'm having trouble connecting right now."
+            
+            if full_response:
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+    # Initial session setup and welcome message
+    if not st.session_state.get("session_id"):
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            with st.spinner("Meaty is preparing your session..."):
+                try:
+                    payload = {"session_meta": st.session_state.session_meta}
+                    with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                        r.raise_for_status()
+                        for line in r.iter_lines():
+                            if line:
+                                event = json.loads(line.decode('utf-8'))
+                                if event["type"] == "session_id":
+                                    st.session_state.session_id = event["id"]
+                                elif event["type"] == "welcome_message":
+                                    full_response += event["content"]
+                                    placeholder.markdown(full_response + "▌")
+                                elif event["type"] == "error":
+                                     st.error(event['content'])
+                                     break
+                    placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except requests.RequestException as e:
+                    st.error(f"Could not initialize chat session: {e}")
+
+
+# --- Main Application Logic ---
+if "stage" not in st.session_state:
+    st.session_state.stage = "setup"
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+
+if st.session_state.stage == "setup":
+    render_setup_page()
+else:
+    render_chat_page()

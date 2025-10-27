@@ -1,0 +1,14 @@
+[Unit]
+Description=Bengal Meat Chatbot Service
+After=network.target
+
+[Service]
+User=ansary
+Group=ansary
+WorkingDirectory=/home/ansary/cliens/bengalmeat/OrchastratorChatBot
+ExecStart=/home/ansary/anaconda3/envs/chatbot/bin/uvicorn api_service:app --host 0.0.0.0 --port 9000
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

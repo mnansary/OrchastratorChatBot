@@ -211,3 +211,4 @@ debug*
 .gradio
 .vscode/
 nohup.out
+alembic/versions/*

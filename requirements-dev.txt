@@ -1,0 +1,18 @@
+# --- START OF NEW FILE: requirements-dev.txt ---
+
+# Core testing framework
+pytest==8.2.2
+
+# Plugin for testing asyncio code with pytest
+pytest-asyncio==0.23.7
+
+# Modern, high-performance async HTTP client for making API requests
+httpx==0.28.1
+
+# Required by pytest-asyncio for handling async generators in tests
+async-generator==1.10
+
+# The redis library is needed to directly inspect Redis state for verification
+redis==5.0.4
+
+# --- END OF NEW FILE: requirements-dev.txt ---

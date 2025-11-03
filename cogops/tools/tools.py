@@ -6,6 +6,7 @@ from typing import List, Dict, Any
 from cogops.tools.custom.knowledge_retriever import retrieve_knowledge
 from cogops.tools.public.product_tools import get_product_details_as_markdown
 from cogops.tools.private.order_tools import get_user_order_profile_as_markdown
+from cogops.tools.public.promotions_tools import get_promotional_products
 
 # --- Available Tools Map ---
 # This dictionary maps the function name (the "key") to the actual Python function object (the "value").
@@ -17,6 +18,8 @@ available_tools_map = {
     
     # Private, Context-Enrichment Tools (require a valid user session)
     "get_user_order_profile_as_markdown": get_user_order_profile_as_markdown,
+    # --- NEW: Add the promotional products tool to the map ---
+    "get_promotional_products": get_promotional_products,
 }
 
 
@@ -73,6 +76,30 @@ tools_list = [
                     }
                 },
                 "required": ["slug", "store_id", "customer_id"]
+            }
+        }
+    },
+    # ===================================================================
+    # PRODUCT DISCOVERY & PROMOTIONAL TOOLS
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "get_promotional_products",
+            "description": "Use this tool to answer user questions about product recommendations, deals, popular items, or best-selling products. It can fetch multiple categories at once. This is the main tool for product discovery questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["best_sellers", "best_deals", "popular_items"]
+                        },
+                        "description": "A list of categories to fetch. Use the category that best matches the user's query. For example, if the user asks 'What's on sale?', use ['best_deals']. If they ask 'What do you recommend?', a good default is ['best_sellers', 'popular_items']."
+                    }
+                },
+                "required": ["categories"]
             }
         }
     },

@@ -1,0 +1,87 @@
+# --- START OF FILE: requirements.txt ---
+
+# ===================================================================
+# CORE WEB FRAMEWORK & ASYNC
+# ===================================================================
+fastapi==0.119.1
+uvicorn==0.38.0
+starlette==0.48.0
+anyio==4.11.0
+asgiref==3.10.0
+h11==0.16.0
+httptools==0.7.1
+uvloop==0.22.1
+websockets==15.0.1
+
+# ===================================================================
+# DATABASE & STATE MANAGEMENT
+# REASON: These are the new and existing libraries for a professional,
+# persistent backend. Redis for caching, PostgreSQL for permanent storage.
+# ===================================================================
+# Asynchronous Redis client for session management ---
+aioredis==2.0.1
+
+#  Database migration tool ---
+alembic==1.13.1
+
+#  Asynchronous PostgreSQL driver ---
+asyncpg==0.29.0
+
+#  Database Libraries ---
+SQLAlchemy==2.0.44
+psycopg2-binary==2.9.11
+redis==7.0.0
+PyPika==0.48.9
+
+# ===================================================================
+# LLM, AI & DATA PROCESSING
+# ===================================================================
+openai==2.6.0
+transformers==4.57.1
+torch==2.9.0
+tokenizers==0.22.1
+safetensors==0.6.2
+huggingface-hub==0.35.3
+onnxruntime-gpu==1.23.2
+triton==3.5.0
+tritonclient==2.61.0
+numpy==1.26.4
+pandas==2.3.3
+pyarrow==21.0.0
+
+
+
+# ===================================================================
+# VECTOR DATABASE
+# ===================================================================
+chromadb==0.5.3
+chroma-hnswlib==0.7.3
+
+# ===================================================================
+# FRONTEND & VISUALIZATION
+# ===================================================================
+streamlit==1.50.0
+altair==5.5.0
+pydeck==0.9.1
+
+# ===================================================================
+# UTILITIES & MISCELLANEOUS
+# ===================================================================
+# -e git+https://github.com/mnansary/OrchastratorChatBot.git@f0ba10af9f7e5c34b531d05792daf42dc724972c#egg=cogops
+aiohttp==3.13.1
+beautifulsoup4==4.14.2
+bs4==0.0.2
+bcrypt==5.0.0
+click==8.3.0
+coloredlogs==15.0.1
+loguru==0.7.3
+pydantic==2.12.3
+python-dotenv==1.1.1
+PyYAML==6.0.3
+requests==2.32.5
+tqdm==4.67.1
+tenacity==9.1.2
+Jinja2==3.1.6
+watchfiles==1.1.1
+
+# --- END OF FILE: requirements.txt ---

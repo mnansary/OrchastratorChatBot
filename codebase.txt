@@ -1,0 +1,3265 @@
+================================================================================
+--- File: api_service.py ---
+================================================================================
+
+# --- START OF FINAL CORRECTED FILE: api_service.py ---
+
+import asyncio
+import json
+import uvicorn
+import uuid
+import logging
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List
+
+# --- Core Application Components ---
+from cogops.agent import ChatAgent
+from cogops.context_manager import context_manager
+from cogops.utils.redis_manager import redis_manager
+from cogops.utils.db_config import get_postgres_config
+from sqlalchemy import create_engine, insert, update, select
+from sqlalchemy.orm import sessionmaker, Session
+from cogops.retriver.db import Sessions, ConversationHistory
+from datetime import datetime
+
+# CRITICAL FIX: Import the correct synchronous cleanup function.
+from cogops.tasks.cleanup import purge_deleted_sessions_sync
+
+# --- Global Configuration ---
+AGENT_CONFIG_PATH = "configs/config.yaml"
+DEFAULT_STORE_ID = 37
+GUEST_CUSTOMER_ID = "369"
+CLEANUP_INTERVAL_SECONDS = 3600  # Run every 1 hour
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+chat_agent: Optional[ChatAgent] = None
+db_config = get_postgres_config()
+engine = create_engine(f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}")
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+app = FastAPI(
+    title="Bengal Meat Chat Agent API",
+    description="A stateless, session-based API for the Bengal Meat Chat Agent.",
+    version="4.1.0", # Final Version
+)
+
+# CRITICAL FIX: The scheduler now runs the synchronous DB task in a separate thread.
+# REASON: This prevents blocking the main application's async event loop, which is a critical performance issue.
+async def run_cleanup_scheduler():
+    """
+    A simple asyncio-based scheduler that runs the synchronous purge task
+    in a separate thread at a regular interval.
+    """
+    logging.info(f"Cleanup scheduler started. Will run every {CLEANUP_INTERVAL_SECONDS} seconds.")
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            with SessionLocal() as db:
+                # Run the blocking function in a thread pool to avoid blocking the event loop.
+                await asyncio.to_thread(purge_deleted_sessions_sync, db)
+        except Exception as e:
+            logging.error(f"An error occurred in the cleanup scheduler: {e}", exc_info=True)
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    On application startup:
+    1. Build static context.
+    2. Initialize the ChatAgent singleton.
+    3. Start the background cleanup scheduler.
+    """
+    global chat_agent
+    logging.info("Application startup: Building static context...")
+    context_manager.build_static_context(store_id=DEFAULT_STORE_ID, customer_id=GUEST_CUSTOMER_ID)
+    logging.info("Initializing stateless ChatAgent singleton...")
+    chat_agent = ChatAgent(config_path=AGENT_CONFIG_PATH)
+    
+    # Launch the scheduler as a background task.
+    asyncio.create_task(run_cleanup_scheduler())
+    
+    logging.info("✅ Application is ready to accept requests.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logging.info("Application shutdown: Closing connections...")
+    await redis_manager.close_pool()
+    logging.info("✅ Connections closed.")
+
+# --- Pydantic Models ---
+class ChatRequest(BaseModel):
+    session_meta: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    query: Optional[str] = None
+
+class ClearSessionRequest(BaseModel):
+    session_id: str
+
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+    created_at: datetime
+
+class HistoryResponse(BaseModel):
+    session_id: str
+    history: List[HistoryMessage]
+
+# --- Database Dependency & Helpers ---
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def log_new_session_to_db(session_id: str, session_meta: Dict[str, Any]):
+    with SessionLocal() as db:
+        stmt = insert(Sessions).values(
+            session_id=session_id, user_id=session_meta.get('user_id'), store_id=session_meta.get('store_id')
+        )
+        db.execute(stmt)
+        db.commit()
+    logging.info(f"Logged new session to PostgreSQL: {session_id}")
+
+def log_conversation_turn_to_db(session_id: str, user_query: str, assistant_response: str):
+    with SessionLocal() as db:
+        user_stmt = insert(ConversationHistory).values(
+            session_id=session_id, role='user', content=user_query
+        )
+        assistant_stmt = insert(ConversationHistory).values(
+            session_id=session_id, role='assistant', content=assistant_response
+        )
+        db.execute(user_stmt)
+        db.execute(assistant_stmt)
+        db.commit()
+
+def mark_session_deleted_in_db(session_id: str):
+    with SessionLocal() as db:
+        stmt = update(Sessions).where(Sessions.session_id == session_id).values(deleted_at=datetime.utcnow())
+        db.execute(stmt)
+        db.commit()
+
+# --- API Endpoints ---
+@app.get("/health", tags=["Monitoring"])
+async def health_check():
+    return {"status": "ok"}
+
+@app.get("/chat/history/{session_id}", response_model=HistoryResponse, tags=["Session Management"])
+async def get_chat_history(session_id: str, db: Session = Depends(get_db)):
+    session_record = db.query(Sessions).filter(Sessions.session_id == session_id, Sessions.deleted_at == None).first()
+    if not session_record:
+        raise HTTPException(status_code=404, detail="Session not found or has been deleted.")
+    history_records = db.query(ConversationHistory).filter(ConversationHistory.session_id == session_id).order_by(ConversationHistory.created_at.asc()).all()
+    return HistoryResponse(
+        session_id=session_id,
+        history=[
+            HistoryMessage(role=record.role, content=record.content, created_at=record.created_at) for record in history_records
+        ]
+    )
+
+@app.post("/chat/clear_session", tags=["Session Management"])
+async def clear_session(request: ClearSessionRequest, background_tasks: BackgroundTasks):
+    session_id = request.session_id
+    # Immediate deletion from Redis for responsiveness.
+    await redis_manager.delete_session(session_id)
+    # Background task to soft-delete from PostgreSQL.
+    background_tasks.add_task(mark_session_deleted_in_db, session_id)
+    logging.info(f"-> Cleared session for session_id: {session_id}")
+    return {"status": "success", "message": f"Session '{session_id}' has been cleared."}
+
+@app.post("/chat/stream", tags=["Chat"])
+async def stream_chat(chat_request: ChatRequest, background_tasks: BackgroundTasks):
+    async def response_generator():
+        if chat_request.session_meta and not chat_request.session_id:
+            if 'store_id' not in chat_request.session_meta:
+                yield f'{json.dumps({"type": "error", "content": "FATAL: store_id is missing."})}\n'
+                return
+            new_session_id = str(uuid.uuid4())
+            await redis_manager.create_session(new_session_id, chat_request.session_meta)
+            background_tasks.add_task(log_new_session_to_db, new_session_id, chat_request.session_meta)
+            yield f'{json.dumps({"type": "session_id", "id": new_session_id})}\n'
+            async for event in chat_agent.generate_welcome_message(chat_request.session_meta):
+                yield f"{json.dumps(event, ensure_ascii=False)}\n"
+            return
+        elif chat_request.session_id:
+            if not chat_request.query:
+                yield f'{json.dumps({"type": "error", "content": "Query is missing."})}\n'
+                return
+            session_id = chat_request.session_id
+            session_meta = await redis_manager.get_session(session_id)
+            if not session_meta:
+                yield f'{json.dumps({"type": "error", "content": f"Invalid session_id: {session_id}"})}\n'
+                return
+            history = await redis_manager.get_history(session_id)
+            user_context = await chat_agent.generate_user_context(session_meta)
+            full_assistant_response = []
+            stream = chat_agent.process_query(
+                user_query=chat_request.query, session_meta=session_meta, history=history,
+                location_context=context_manager.location_context, store_catalog=context_manager.store_catalog,
+                user_context=user_context
+            )
+            async for event in stream:
+                if event.get("type") == "answer_chunk":
+                    full_assistant_response.append(event.get("content", ""))
+                yield f"{json.dumps(event, ensure_ascii=False)}\n"
+            final_response_str = "".join(full_assistant_response).strip()
+            if final_response_str:
+                await redis_manager.append_to_history(session_id, chat_request.query, final_response_str)
+                background_tasks.add_task(log_conversation_turn_to_db, session_id, chat_request.query, final_response_str)
+            return
+        else:
+            yield f'{json.dumps({"type": "error", "content": "Invalid request."})}\n'
+    return StreamingResponse(response_generator(), media_type="application/x-ndjson")
+
+if __name__ == "__main__":
+    uvicorn.run("api_service:app", host="0.0.0.0", port=9000, reload=True)
+
+# --- END OF FINAL CORRECTED FILE: api_service.py ---
+
+================================================================================
+--- File: app.py ---
+================================================================================
+
+# FILE: streamlit_app.py
+
+import streamlit as st
+import requests
+import json
+import time
+
+# --- Configuration ---
+API_BASE_URL = "http://localhost:9000"
+CHAT_ENDPOINT = f"{API_BASE_URL}/chat/stream"
+LOGIN_API_URL = "https://api.bengalmeat.com/auth/customer-login"
+
+# --- Page Setup ---
+st.set_page_config(
+    page_title="Bengal Meat Assistant",
+    page_icon="🥩",
+    layout="centered"
+)
+
+# --- Helper Functions ---
+
+@st.cache_data(ttl=3600)
+def fetch_stores() -> dict:
+    """Fetches store locations from the public company API."""
+    try:
+        response = requests.get("https://api.bengalmeat.com/store/storelistopen/1?is_visible=1")
+        response.raise_for_status()
+        stores = response.json().get('data', [])
+        # Filter out any test stores
+        return {
+            f"{store['name']} ({store.get('CITY', 'N/A')})": store['id'] 
+            for store in stores if "test" not in store.get("name", "").lower()
+        }
+    except Exception as e:
+        st.error(f"Could not fetch store list. Using fallback. Error: {e}")
+        return {"Mohammadpur Butcher Shop": 37, "Gulshan-2 GB": 67} # Sensible fallback
+
+def reset_session():
+    """Clears the session state to start a new chat."""
+    keys_to_clear = [key for key in st.session_state.keys() if key != 'stores']
+    for key in keys_to_clear:
+        del st.session_state[key]
+    # Re-initialize essential state
+    st.session_state.stage = "setup"
+    st.session_state.messages = []
+    st.session_state.session_id = None
+    st.rerun()
+
+# --- UI Sections ---
+
+def render_setup_page():
+    """Renders the initial screen for store selection and login."""
+    st.image("https://bengalmeat.com/wp-content/uploads/2023/11/logo.png", width=200)
+    st.title("Welcome to Bengal Meat's Chat Assistant!")
+    st.markdown("Please select your nearest store and log in to begin.")
+
+    if 'stores' not in st.session_state:
+        st.session_state.stores = fetch_stores()
+
+    selected_store_name = st.selectbox(
+        "Choose your store",
+        options=list(st.session_state.stores.keys()),
+        key="selected_store_name"
+    )
+    
+    login_tab, guest_tab = st.tabs(["Login", "Continue as Guest"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            login_button = st.form_submit_button("Login and Start Chat")
+
+            if login_button:
+                store_id = st.session_state.stores[selected_store_name]
+                with st.spinner("Logging in and preparing your personalized session..."):
+                    try:
+                        response = requests.post(LOGIN_API_URL, json={"email": email, "password": password})
+                        response.raise_for_status()
+                        login_data = response.json()
+                        
+                        # Use .get() for safer dictionary access
+                        if login_data.get("statusCode") == 201 and login_data.get("data"):
+                            user_data = login_data["data"].get("user", {})
+                            st.session_state.session_meta = {
+                                "store_id": store_id,
+                                "user_id": user_data.get("id"),
+                                "access_token": login_data["data"].get("accessToken"),
+                                "refresh_token": login_data["data"].get("refreshToken"),
+                            }
+                            st.session_state.stage = 'chat'
+                            st.rerun() # --- CHANGE: Automatically transition to chat ---
+                        else:
+                            st.error(f"Login failed: {login_data.get('message', 'Unknown error')}")
+                    except requests.RequestException as e:
+                        st.error(f"Login connection failed. Please check the server. Error: {e}")
+
+    with guest_tab:
+        if st.button("Continue as Guest and Start Chat"):
+            store_id = st.session_state.stores[selected_store_name]
+            st.session_state.session_meta = {
+                "store_id": store_id,
+                "user_id": None, "access_token": None, "refresh_token": None
+            }
+            st.session_state.stage = 'chat'
+            st.rerun() # --- CHANGE: Automatically transition to chat ---
+
+def render_chat_page():
+    """Renders the main chat interface and handles API communication."""
+    st.title("🥩 Chat with Meaty")
+    st.button("End Session & Start Over", on_click=reset_session)
+    st.markdown("---")
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Handle chat input from the user
+    if prompt := st.chat_input("Ask about products, offers, or your orders..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Prepare request payload for an existing session
+        payload = {"query": prompt, "session_id": st.session_state.session_id}
+        
+        # Display streaming response
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            tool_call_in_progress = False
+            
+            try:
+                with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if line:
+                            event = json.loads(line.decode('utf-8'))
+                            
+                            # --- CHANGE: Handle different event types from the backend ---
+                            event_type = event.get("type")
+                            
+                            if event_type == "tool_call":
+                                tool_name = event.get("tool_name", "a tool")
+                                placeholder.markdown(f"*(Searching for information using {tool_name}...)*")
+                                tool_call_in_progress = True
+                                
+                            elif event_type == "answer_chunk":
+                                if tool_call_in_progress:
+                                    # Clear the "thinking" message when the first text chunk arrives
+                                    full_response = ""
+                                    tool_call_in_progress = False
+                                
+                                full_response += event["content"]
+                                placeholder.markdown(full_response + "▌")
+                                
+                            elif event_type == "error":
+                                st.error(event.get('content', 'An unknown error occurred.'))
+                                break
+                
+                placeholder.markdown(full_response)
+            except requests.RequestException as e:
+                st.error(f"Failed to get response from chat service: {e}")
+                full_response = "Sorry, I'm having trouble connecting right now."
+            
+            if full_response:
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+    # Initial session setup and welcome message
+    if not st.session_state.get("session_id"):
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            full_response = ""
+            with st.spinner("Meaty is preparing your session..."):
+                try:
+                    payload = {"session_meta": st.session_state.session_meta}
+                    with requests.post(CHAT_ENDPOINT, json=payload, stream=True) as r:
+                        r.raise_for_status()
+                        for line in r.iter_lines():
+                            if line:
+                                event = json.loads(line.decode('utf-8'))
+                                if event["type"] == "session_id":
+                                    st.session_state.session_id = event["id"]
+                                elif event["type"] == "welcome_message":
+                                    full_response += event["content"]
+                                    placeholder.markdown(full_response + "▌")
+                                elif event["type"] == "error":
+                                     st.error(event['content'])
+                                     break
+                    placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except requests.RequestException as e:
+                    st.error(f"Could not initialize chat session: {e}")
+
+
+# --- Main Application Logic ---
+if "stage" not in st.session_state:
+    st.session_state.stage = "setup"
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
+
+if st.session_state.stage == "setup":
+    render_setup_page()
+else:
+    render_chat_page()
+
+================================================================================
+--- File: .env ---
+================================================================================
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_EMBEDDER_URL="http://localhost:6000/"
+
+# --- vLLM OpenAI-Compatible Endpoint ---
+VLLM_BASE_URL="http://localhost:5000/v1/"
+VLLM_API_KEY="YOUR_VLLM_API_KEY"
+VLLM_MODEL_NAME="cpatonn/Qwen3-VL-30B-A3B-Instruct-AWQ-8bit"
+
+# --- chroma ------
+CHROMA_DB_HOST="localhost"
+CHROMA_DB_PORT="8443"
+
+# --- postgres ------
+POSTGRES_HOST       =   localhost
+POSTGRES_PORT       =   5432
+POSTGRES_USER       =   postgres
+POSTGRES_PASSWORD   =   o+iLHv2VzpHcVY0s1yalhX5yxGjoozVUPaBf71KUnHE=
+POSTGRES_DB         =   bengalmeat_fixed
+
+# --- configs -----
+CONFIG_FILE_PATH="/home/ansary/cliens/bengalmeat/OrchastratorChatBot/configs/config.yaml"
+COMPANY_API_BASE_URL="https://api.bengalmeat.com"
+
+================================================================================
+--- File: alembic.ini ---
+================================================================================
+
+# --- START OF FILE: alembic.ini ---
+# Alembic Configuration File
+# REASON FOR CHANGE: This file is modified to securely connect to your PostgreSQL
+# database by reading credentials from the .env file at the project root.
+
+[alembic]
+# Path to the directory containing your migration scripts.
+script_location = alembic
+
+# CRITICAL CHANGE: Tell Alembic where your .env file is located.
+# It will automatically load these variables before reading the sqlalchemy.url.
+prepend_sys_path = .
+# This variable name is a convention used in env.py to load .env
+# This is a placeholder; the real loading happens in env.py, but this makes the intent clear.
+# For simplicity and directness, we will point sqlalchemy.url directly.
+
+# CRITICAL CHANGE: The connection string for your database.
+# Alembic will substitute ${...} with environment variables.
+# This prevents hardcoding passwords and connection details.
+# sqlalchemy.url = postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+# --- END OF FILE: alembic.ini ---
+
+================================================================================
+--- File: configs/config.yaml ---
+================================================================================
+
+# ===================================================================
+# Tool-Based Chat Agent Master Configuration
+# ===================================================================
+# This configuration is designed for an agent that uses a single powerful
+# LLM to orchestrate calls to a predefined set of tools.
+
+agent_name: "meaty"
+agent_story: "বেঙ্গল মিট-এর পক্ষ থেকে আপনার ব্যক্তিগত সহকারী। নিরাপদ ও স্বাস্থ্যকর মাংস খুঁজে পেতে, সেরা অফারগুলো জানতে এবং আপনার যেকোনো প্রশ্নের উত্তর দিতে আমি এখানে আছি। আসুন, আপনার প্রয়োজন অনুযায়ী সেরা পণ্যটি বেছে নিতে আমি আপনাকে সাহায্য করি।"
+
+# --- Primary LLM Service Definition ---
+# The single, orchestrating LLM that will handle reasoning and tool calls.
+llm_service:
+  name: "primary_llm"
+  api_key_env: "VLLM_API_KEY"
+  model_name_env: "VLLM_MODEL_NAME"
+  base_url_env: "VLLM_BASE_URL"
+  max_context_tokens: 32000 # Max context window for the model.
+
+# --- Conversation Management ---
+conversation:
+  history_window: 10  # Number of past user/AI exchanges to retain in memory.
+
+# --- Vector Retriever Configuration (for the 'retrieve_knowledge' tool) ---
+vector_retriever:
+  top_k: 10 # Number of initial candidates to retrieve from each ChromaDB collection.
+  collections:
+    - "PropositionsDB"
+    - "SummariesDB"
+    - "QuestionsDB"
+  max_passages_to_select: 3 # Final number of passages to return after RRF fusion.
+  # Reciprocal Rank Fusion (RRF) constant. A standard value is 60.
+  # Lower values prioritize top-ranked items more heavily.
+  rrf_k: 60
+  # The key in the vector metadata that stores the unique passage identifier.
+  passage_id_meta_key: "passage_id"
+
+# --- Token Management for Prompt Construction ---
+# Manages how the final prompt is built to avoid exceeding the context limit.
+token_management:
+  # The model name (from an environment variable) to use for tokenization.
+  # This should match the primary LLM to ensure accurate token counting.
+  tokenizer_model_name_env: "VLLM_MODEL_NAME"
+  # A fixed number of tokens reserved for the master system prompt's instructions,
+  # ensuring that dynamic content (like history) doesn't push it out of context.
+  prompt_template_reservation_tokens: 1024
+  # The percentage of the remaining token budget to allocate for conversation history.
+  # Here, 40% of the available space (after reserving for the template and query)
+  # will be used for history. The rest is for tool results.
+  history_truncation_budget: 0.4
+
+# --- LLM Call Parameters ---
+# Default generation parameters for the primary LLM's final response, after
+# it has received the results from any tool calls.
+llm_call_parameters:
+  temperature: 0.1
+  max_tokens: 2048 # Max tokens for the final generated answer.
+
+# --- Response Templates ---
+# Standardized text for specific scenarios handled by the agent's logic.
+response_templates:
+  error_fallback: "একটি প্রযুক্তিগত ত্রুটির কারণে আমি এই মুহূর্তে সাহায্য করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
+  tool_failure: "একটি প্রযুক্তিগত সমস্যার কারণে আমি এই মুহূর্তে তথ্য যাচাই করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।"
+  no_passages_found: "দুঃখিত, আমি আপনার অনুরোধ সম্পর্কিত কোনো তথ্য আমার জ্ঞানভান্ডারে খুঁজে পাচ্ছি না।"
+
+================================================================================
+--- File: cogops/context_manager.py ---
+================================================================================
+
+# FILE: cogops/context_manager.py (New File)
+
+import logging
+from cogops.tools.public.product_tools import get_product_catalog_as_markdown
+from cogops.tools.public.location_tools import generate_location_and_delivery_markdown
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ContextManager:
+    """
+    A singleton-like class to generate and hold global, static context strings
+    that are expensive to create and rarely change (e.g., on server restart).
+    """
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        # This ensures only one instance of ContextManager ever exists.
+        if not cls._instance:
+            cls._instance = super(ContextManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        # The __init__ might be called multiple times, but we only want to initialize once.
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        
+        self.location_context: str = ""
+        self.store_catalog: str = ""
+        self._initialized = True
+        logging.info("ContextManager initialized.")
+
+    def build_static_context(self, store_id: int, customer_id: str):
+        """
+        Calls the necessary functions to generate the static Markdown contexts.
+        This should be run once at application startup by the main API service.
+        
+        Args:
+            store_id: A default or primary store_id to generate the initial catalog.
+            customer_id: A guest customer_id for generating the initial catalog.
+        """
+        logging.info("Building static context: Fetching locations and product catalog...")
+        
+        # 1. Generate Location & Delivery Info Markdown
+        # This function calls multiple APIs and combines them into one string.
+        self.location_context = generate_location_and_delivery_markdown()
+        if not self.location_context:
+            logging.error("CRITICAL: Failed to build location context!")
+            self.location_context = "# Location Information\n\n*Error: Could not retrieve location data.*"
+
+        # 2. Generate Store Product Catalog Markdown
+        # This function calls the product list API and formats it.
+        self.store_catalog = get_product_catalog_as_markdown(store_id=store_id, customer_id=customer_id)
+        if not self.store_catalog:
+            logging.error("CRITICAL: Failed to build store catalog context!")
+            self.store_catalog = "# Store Catalog\n\n*Error: Could not retrieve product catalog.*"
+
+        logging.info("✅ Static context build complete. The application is ready.")
+
+# Create a single instance that will be imported and used by other parts of the application.
+context_manager = ContextManager()
+
+================================================================================
+--- File: cogops/agent.py ---
+================================================================================
+
+# --- START OF MODIFIED FILE: cogops/agent.py ---
+
+import os
+import yaml
+import json
+import asyncio
+import logging
+from typing import AsyncGenerator, Dict, Any, List, Tuple
+
+from openai import APIConnectionError, APITimeoutError
+from requests.exceptions import RequestException
+
+from cogops.prompt import AGENT_PROMPT
+from cogops.tools.tools import tools_list, available_tools_map
+from cogops.models.qwen3async_llm import AsyncLLMService
+from cogops.tools.private.user_tools import generate_full_user_context_markdown
+from cogops.utils.token_manager import TokenManager
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ChatAgent:
+    """
+    A STATELESS, end-to-end conversational agent.
+    REASON FOR CHANGE: This agent is no longer initialized per-session. It is created
+    once and holds no session-specific state (like history or user_meta). All dynamic
+    context is passed directly into its processing methods. This makes the application
+    scalable and robust.
+    """
+    def __init__(self, config_path: str):
+        """
+        Initializes the stateless ChatAgent. This is done only ONCE on application startup.
+        """
+        logging.info("Initializing STATELESS ChatAgent singleton...")
+        self.config = self._load_config(config_path)
+
+        # --- Agent Identity (Static) ---
+        self.agent_name = self.config.get('agent_name', 'Bengal Meat Assistant')
+        self.agent_story = self.config.get('agent_story', 'I am a helpful AI assistant.')
+
+        # --- Core Services (Static) ---
+        self.llm_service = self._initialize_llm_service()
+        self.token_manager = self._initialize_token_manager()
+
+        # --- Tool Configuration (Static) ---
+        self.tools_schema = tools_list
+        self.tool_functions = available_tools_map
+        self.tools_description = json.dumps(self.tools_schema, indent=4)
+
+        # --- Response Templates (Static) ---
+        self.response_templates = self.config['response_templates']
+        logging.info("✅ Stateless ChatAgent singleton initialized.")
+
+    def _load_config(self, config_path: str) -> Dict:
+        """Loads the agent's YAML configuration file."""
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"[FATAL ERROR] Configuration file not found at: {config_path}")
+            raise
+
+    def _initialize_llm_service(self) -> AsyncLLMService:
+        """Initializes the asynchronous LLM service client from configuration."""
+        cfg = self.config['llm_service']
+        api_key = os.getenv(cfg['api_key_env'])
+        model = os.getenv(cfg['model_name_env'])
+        url = os.getenv(cfg['base_url_env'])
+        max_tokens = cfg.get('max_context_tokens', 32000)
+        if not all([api_key, model, url]):
+            raise ValueError("Missing LLM service environment variables.")
+        return AsyncLLMService(api_key, model, url, max_tokens)
+
+    def _initialize_token_manager(self) -> TokenManager:
+        """Initializes the TokenManager for safe prompt construction."""
+        tm_config = self.config['token_management']
+        tokenizer_model = os.getenv(tm_config['tokenizer_model_name_env'])
+        if not tokenizer_model:
+            raise ValueError("Missing tokenizer model environment variable.")
+        return TokenManager(
+            model_name=tokenizer_model,
+            reservation_tokens=tm_config['prompt_template_reservation_tokens'],
+            history_budget=tm_config['history_truncation_budget']
+        )
+
+    async def generate_user_context(self, session_meta: Dict[str, Any]) -> str:
+        """
+        Generates user-specific context (profile, orders) for a logged-in user.
+        REASON FOR CHANGE: This is now a utility method that returns the context string
+        instead of setting an instance variable.
+
+        Returns:
+            str: A Markdown string of the user's context, or a default for guests.
+        """
+        if not session_meta.get('user_id'):
+            return "# User Context\n\n*This is a guest user session.*"
+        try:
+            # Run the blocking network calls in a separate thread.
+            context_string = await asyncio.to_thread(
+                generate_full_user_context_markdown,
+                session_meta
+            )
+            return context_string
+        except Exception as e:
+            logging.error(f"Failed to enrich user context for user {session_meta['user_id']}: {e}", exc_info=True)
+            return "# User Context\n\n*Error: Could not retrieve user profile and order data.*"
+
+    async def generate_welcome_message(self, session_meta: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Generates a welcome message, now accepting session_meta as an argument.
+        """
+        if session_meta.get('user_id'):
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে আবার স্বাগতম! আমি আপনার ব্যক্তিগত সহকারী, {self.agent_name}। আপনাকে কীভাবে সাহায্য করতে পারি?"
+        else:
+            welcome_text = f"বেঙ্গল মিট-এ আপনাকে স্বাগতম! আমি {self.agent_name}। আমি আপনাকে আমাদের পণ্য, অফার এবং স্টোর খুঁজে পেতে সাহায্য করতে পারি। বলুন, কীভাবে শুরু করতে পারি?"
+        yield {"type": "welcome_message", "content": welcome_text}
+
+    async def process_query(
+        self,
+        user_query: str,
+        session_meta: Dict[str, Any],
+        history: List[Tuple[str, str]],
+        location_context: str,
+        store_catalog: str,
+        user_context: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Processes a user's query using the provided, complete context for this turn.
+        REASON FOR CHANGE: This method is now stateless. It receives all required
+        context as arguments for a single processing cycle.
+        """
+        logging.info(f"--- Processing Query: '{user_query}' for store_id: {session_meta.get('store_id')} ---")
+
+        try:
+            master_prompt = self.token_manager.build_safe_prompt(
+                template=AGENT_PROMPT,
+                max_tokens=self.llm_service.max_context_tokens,
+                agent_name=self.agent_name,
+                agent_story=self.agent_story,
+                tools_description=self.tools_description,
+                history=history,
+                user_query=user_query,
+                session_meta=json.dumps(session_meta, indent=2),
+                user_context=user_context,
+                location_context=location_context,
+                store_catalog=store_catalog
+            )
+
+            messages = [
+                {"role": "system", "content": master_prompt},
+                {"role": "user", "content": user_query}
+            ]
+
+            llm_call_params = self.config.get('llm_call_parameters', {})
+
+            stream_generator = self.llm_service.stream_with_tool_calls(
+                messages=messages,
+                tools=self.tools_schema,
+                available_tools=self.tool_functions,
+                session_meta=session_meta,
+                **llm_call_params
+            )
+
+            async for event in stream_generator:
+                yield event
+
+        except (APIConnectionError, APITimeoutError, RequestException) as e:
+            logging.error(f"A network service is unavailable. Underlying error: {e}")
+            yield {"type": "error", "content": self.response_templates['error_fallback']}
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during query processing: {e}", exc_info=True)
+            yield {"type": "error", "content": self.response_templates['error_fallback']}
+
+
+# --- END OF MODIFIED FILE: cogops/agent.py ---
+
+================================================================================
+--- File: cogops/prompt.py ---
+================================================================================
+
+# FILE: prompt.py
+import json
+from typing import Dict, Any
+
+# FILE: prompt.py
+
+# ... (imports remain the same) ...
+
+AGENT_PROMPT = """
+### **[MASTER SYSTEM PROMPT - BENGAL MEAT SALES & SUPPORT ASSISTANT]**
+
+**[SECTION 1: CORE DIRECTIVES & PERSONA]**
+
+You are **{agent_name}**, an autonomous AI sales and support assistant for Bengal Meat. Your purpose is to help customers feel guided, assured, and valued. This document is your immutable Standard Operating Procedure (SOP).
+
+*   **Principle 1: Absolute Language Adherence.** This is your most important linguistic rule. The language of your final response **MUST STRICTLY** match the language of the user's query.
+    *   If the user's query is in **English**, you **MUST** respond **ONLY** in **English**.
+    *   If the user's query is in **Bangla** or **Romanized Bangla ('Banglish')**, you **MUST** respond **ONLY** in standard, formal **Bangla**. There are no exceptions to this rule.
+
+*   **Principle 2: Persona & Tone.** Your personality is caring, professional, and dependable. Your tone must be formal but friendly, warm, and respectful. Your style is clear, concise, and polite. You **MUST ALWAYS** use the formal "আপনি" pronoun when addressing users in Bangla; never use "তুমি".
+
+*   **Principle 3: The Principle of Assumed Relevance.** This is your primary operational directive for handling user queries.
+    1.  After ensuring a query is not harmful or malicious (per the Safety Protocol), your default assumption **MUST** be that the user's intent is related to Bengal Meat.
+    2.  If you are not 100% certain about the user's intent but it has a chance of being related to Bengal Meat's products, services, or policies, your first action **MUST** be to use the `retrieve_knowledge` tool with the user's query. This is your primary method for checking if a topic is covered.
+    3.  For any query that explicitly mentions a product, price, or stock, you **MUST** use the appropriate tools (`get_product_details_as_markdown`, etc.) to get live information. **You MUST NOT answer these types of questions from memory.**
+    4.  Only after exhausting tool-based options should you consider the query off-topic.
+
+*   **Principle 4: Strict Scope Limitation.** Your knowledge is strictly limited to Bengal Meat's products and services. If you have confirmed through the `retrieve_knowledge` tool that a topic is not covered, you **MUST POLITELY DECLINE** to answer, following the [Off-Topic Protocol].
+
+*   **Principle 5: Proactive Sales & Engagement Protocol.** Your primary role is to intelligently guide the customer. After successfully answering a query, you **MUST** attempt to engage them further by suggesting relevant promotions, best sellers, or related products.
+
+*   **Principle 6: Intelligent Promotion Protocol.** Your goal is to be a helpful shopping assistant, not a disruptive advertiser. Promotional content must always feel relevant and timely.
+    1.  **Answer First, Promote Second:** ALWAYS answer the user's direct question completely before offering promotional content.
+    2.  **Ensure Strict Relevance:** Only suggest promotions related to the user's current query.
+    3.  **Offer, Don't Announce:** Frame the promotion as a helpful tip and an engaging question.
+    4.  **Don't Overwhelm:** Mention only the single most relevant promotion unless the user explicitly asks for all offers.
+    
+*   **Principle 7: Personalization Protocol.** If the [USER CONTEXT] section is not empty, you **MUST** leverage this information to create a personalized experience (e.g., greet the user by name, use their order history for suggestions, and refer to their saved addresses).
+
+*   **Principle 8: Unwavering Safety.** Adhere strictly to the multi-tiered **[Safety & Guardrail Protocol]**.
+
+*   **Principle 9: Contextual Analysis Before Clarification.** Your actions for resolving ambiguity must follow a strict order:
+    1.  **First, Meticulously Analyze History:** You **MUST** review the full `Conversation History` to see if the context clarifies the current query.
+    2.  **Second, Attempt Knowledge Retrieval:** As per Principle 3, use the `retrieve_knowledge` tool to check for relevant information.
+    3.  **Third, Ask for Clarification:** Only if the query remains ambiguous *after* analyzing history and attempting a tool call, your final resort **MUST** be to politely ask for clarification.
+
+*   **Principle 10: Silent, Complete Execution.** Operate silently. **NEVER** announce your internal actions. You **MUST** complete your entire internal plan (including all necessary tool calls) *before* generating a final response. Your final output must always be a complete, user-facing sentence. **NEVER** output the `<tool_call>` syntax as your final answer.
+
+"""
+# --- End of Section 1 ---
+# (Continue from Section 1)
+
+# (Continue from Section 1)
+
+AGENT_PROMPT += """
+---
+
+**[SECTION 2: AUTONOMOUS TOOLKIT & USAGE PROTOCOL]**
+
+*(This section is dynamically populated with your available tools.)*
+{tools_description}
+
+#### **[Tool Usage Protocol]**
+
+You must adhere to the following rules when using your tools. This is a mandatory part of your operational logic.
+
+*   **1. The Decision Rule: Analyze and Match.**
+    *   Before selecting a tool, you must silently reason about the user's specific intent.
+    *   Your choice of tool **MUST** be a direct, logical match to the function's `description` in the schema above.
+
+*   **2. The Parameter Mandate: Precision is Required.**
+    *   You **MUST** correctly extract all required parameters from the user's query, conversation history, or the `[SESSION METADATA]`.
+    *   **For Public Tools** (like `get_product_details_as_markdown`): You **MUST** provide the `store_id` and a `customer_id`. If the user is not logged in, you **MUST** use the default guest `customer_id`, which is `'369'`.
+    *   **For Private Tools** (like `get_user_order_profile_as_markdown`): You **MUST** pass the entire, unaltered `session_meta` object. This is non-negotiable as it contains the authentication tokens required for secure access.
+
+*   **3. The Synthesis Mandate: Think, Act, then Respond.**
+    *   Your operational loop is: `Think -> Call Tool(s) -> Synthesize -> Respond`.
+    *   After your planned sequence of tool calls is complete, your **ONLY** next action is to formulate the final, user-facing response in the correct language.
+    *   **NEVER** output the raw tool call syntax like `<tool_code>...</tool_code>` as your final answer to the user.
+
+*   **4. The Failure Protocol: Graceful Recovery.**
+    *   If a tool call fails, returns an error, or provides no data (`[]`, `None`), you **MUST** respond gracefully with: "একটি প্রযুক্তিগত ত্রুটির কারণে আমি এই মুহূর্তে তথ্যটি যাচাই করতে পারছি না। অনুগ্রহ করে কিছুক্ষণ পর আবার চেষ্টা করুন।" (Due to a technical error, I cannot verify the information right now. Please try again after some time.)
+
+---
+"""
+# (Continue from the end of SECTION 3)
+
+AGENT_PROMPT += """
+---
+
+**[SECTION 4: GOLD-STANDARD EXAMPLES]**
+
+*This section provides critical examples of your expected thought process and behavior. You must study these patterns to understand how to combine your context and tools effectively.*
+
+*   **Case 1: Simple Knowledge Query**
+    *   **User:** "ফেরত দেওয়ার নিয়ম কী?" (What is the return policy?)
+    *   **Chain of Thought:** The user is asking about a company policy. The `retrieve_knowledge` tool is the perfect fit.
+    *   **Action:** Call `retrieve_knowledge(query="রিটার্ন পলিসি")`.
+    *   **Final Response:** (Summarize the policy found by the tool in clear Bangla).
+
+*   **Case 2: Specific Product Query & Proactive Offer Mention**
+    *   **User:** "বিফ টি-বোন স্টেক এর দাম কত?" (What's the price of a Beef T-bone steak?)
+    *   **Chain of Thought:** User wants the price of a specific product. I must find the 'slug' for "Beef T-bone Steak" in the `[STORE CATALOG]`. Then, I will call `get_product_details_as_markdown` to get the live price. The tool's output may contain an active offer which I must mention.
+    *   **Action Step 1:** Find "Beef T-bone Steak" in `[STORE CATALOG]`, identify its slug (e.g., 'beef-t-bone-steak').
+    *   **Action Step 2:** Call `get_product_details_as_markdown(slug='beef-t-bone-steak', store_id=37, customer_id='369')`.
+    *   **Final Response:** "একটি বিফ টি-বোন স্টেক-এর দাম ১০২০ টাকা। এই মুহূর্তে আমাদের স্টেক আইটেমগুলোর ওপর একটি বিশেষ অফার চলছে, যেখানে আপনি ৫০ টাকা ছাড় পাচ্ছেন। আপনি কি এটি আপনার কার্টে যোগ করতে চান?"
+
+*   **Case 3: Ambiguity Resolution using History & Clarification**
+    *   **User (Turn 1):** "টেন্ডারলয়েন আছে?" (Do you have tenderloin?)
+    *   **Chain of Thought (Turn 1):** The user's query is ambiguous. "Tenderloin" could be beef or mutton. I will check the `[STORE CATALOG]`. I see both 'Beef Tenderloin' and 'Mutton Tenderloin'. I must ask the user to clarify.
+    *   **Final Response (Turn 1):** "হ্যাঁ, আমাদের টেন্ডারলয়েন পাওয়া যায়। আপনি কি গরুর মাংসের টেন্ডারলয়েন খুঁজছেন নাকি খাসির মাংসের?" (Yes, we have tenderloin. Are you looking for beef tenderloin or mutton?)
+    *   **User (Turn 2):** "গরুর" (Beef)
+    *   **Chain of Thought (Turn 2):** The user has clarified they want beef. The conversation history confirms this. Now I will find the slug for "Beef Tenderloin" in the `[STORE CATALOG]` and call the details tool.
+    *   **Action (Turn 2):** Call `get_product_details_as_markdown(slug='beef-tenderloin', store_id=37, customer_id='369')`.
+    *   **Final Response (Turn 2):** (Provide the details for Beef Tenderloin from the tool's output).
+
+*   **Case 4: Complex Multi-Step Reasoning with Location Context**
+    *   **User:** "সিলেটে বিফ বার্গার প্যাটি পাওয়া যাবে?" (Is Beef Burger Patty available in Sylhet?)
+    *   **Chain of Thought:**
+        1.  User asks for a product in a specific city, "Sylhet".
+        2.  I **MUST** check the `[LOCATION CONTEXT]` to find a store ID for Sylhet. I see "BengalMeat Gourmet Butcher Shop - Subid Bazar (Sylhet)" with `Store ID: 49`.
+        3.  I need the slug for "Beef Burger Patty". I find it in the `[STORE CATALOG]`: 'beef-burger-patty'.
+        4.  Call the details tool with the *Sylhet store ID*: `get_product_details_as_markdown(slug='beef-burger-patty', store_id=49, ...)`. The result is "Out of Stock".
+        5.  As a helpful assistant, I should not stop. I will check a major city like Dhaka as an alternative.
+        6.  I check `[LOCATION CONTEXT]` again and find a Dhaka store, e.g., "Gourmet Butcher Shop Dhanmondi-27" with `Store ID: 50`.
+        7.  I call the tool again with the *Dhaka store ID*: `get_product_details_as_markdown(slug='beef-burger-patty', store_id=50, ...)`. The result is "In Stock".
+        8.  I will synthesize this into a complete, helpful answer.
+    *   **Final Response:** "এই মুহূর্তে আমাদের সিলেটের স্টোরগুলোতে বিফ বার্গার প্যাটি স্টক শেষ হয়ে গেছে। তবে, ঢাকার ধানমন্ডি শাখায় এটি পাওয়া যাচ্ছে। আমি কি আপনার জন্য ঢাকার অন্য কোনো এলাকার স্টকে এটি আছে কিনা তা পরীক্ষা করে দেখব?" (Currently, Beef Burger Patty is out of stock in our Sylhet stores. However, it is available at our Dhanmondi branch in Dhaka. Would you like me to check the stock in any other area in Dhaka for you?)
+
+*   **Case 5: Proactive Cross-selling (The Correct Way)**
+    *   **User:** "আপনাদের বিফ কিমা আছে?" (Do you have beef keema?)
+    *   **Chain of Thought:** User is asking about a specific product. I will find the slug for 'Beef Keema' in the `[STORE CATALOG]`, get its details, answer the user, and then proactively suggest a relevant complementary product.
+    *   **Action Step 1:** Find slug 'beef-keema' from `[STORE CATALOG]`.
+    *   **Action Step 2:** Call `get_product_details_as_markdown(slug='beef-keema', ...)`.
+    *   **Final Response:** "হ্যাঁ, আমাদের বিফ কিমা পাওয়া যাচ্ছে। ৫০০ গ্রামের একটি প্যাকেটের দাম ৫৫০ টাকা। আমাদের অনেক গ্রাহক বিফ কিমার সাথে 'শামি কাবাব' তৈরি করতে পছন্দ করেন। এই মুহূর্তে আমাদের 'বিফ শামি কাবাব'-এর ওপর ২৫ টাকা ছাড় চলছে। আপনি কি এটি দেখতে আগ্রহী?" (Yes, we have beef keema. A 500g packet costs 550 BDT. Many of our customers like to make 'Shami Kebab' with beef keema. Currently, there is a 25 TK discount on our 'Beef Shami Kebab'. Would you be interested in seeing it?)
+
+*   **Case 6: Personalized Acknowledgment & Proactive Suggestion**
+    *   **Context:** A logged-in user ("MO MO") is in a session. The `[USER CONTEXT]` shows they have previously purchased "Beef Bone In".
+    *   **User:** "What is the price of Beef Bone In?"
+    *   **Chain of Thought:** The user is logged in and asking about a product. I must check `[USER CONTEXT]`. I see their name is MO MO and they have bought this exact item before. I will answer their question and add a personalized touch acknowledging their preference, then make a relevant cross-sell suggestion.
+    *   **Action:** Call `get_product_details_as_markdown(slug='beef-bone-in', ...)`.
+    *   **Final Response:** "Hi MO MO, welcome back! I see the 'Beef Bone In' is one of your favorites. To answer your question, the price is currently 860 BDT per Kg. Since you enjoy making curries, you might also like our special 'Mezbani Masala' to go with it. Would you like to add either of these to your cart?"
+
+*   **Case 7: Specific Order Status Check**
+    *   **User:** "আমার অর্ডার ২৫০৮১৪১১... এর কী অবস্থা?" (What is the status of my order 25081411...?)
+    *   **Chain of Thought:** The user is logged in and has provided a specific order code. The `get_user_order_profile_as_markdown` tool is the correct choice. I must pass the `order_code` to the tool.
+    *   **Action:** Call `get_user_order_profile_as_markdown(order_code="25081411552764833049")`.
+    *   **Final Response:** "আপনার অর্ডার `25081411552764833049`-এর বর্তমান স্ট্যাটাস 'Pending' দেখাচ্ছে। এটি আগস্ট ১৪, ২০২৫ তারিখে প্লেস করা হয়েছিল। আপনি কি এই অর্ডার সম্পর্কে আরও কিছু জানতে চান?"
+
+*   **Case 8: Using Saved Address to Proactively Answer**
+    *   **Context:** `[USER CONTEXT]` shows the user has a saved address in 'Dhanmondi'.
+    *   **User:** "Can you deliver to my home?"
+    *   **Chain of Thought:** The user is asking about delivery to their home. Their `[USER CONTEXT]` has a saved address. I will check the `[LOCATION CONTEXT]` to see if the area 'Dhanmondi' is listed as a delivery area.
+    *   **Final Response:** "Yes, we can! I see you have a saved address in Dhanmondi, which is within our delivery zone. Would you like to place an order for that address?"
+
+---
+
+**[START OF TASK]**
+
+**[SESSION METADATA]**
+{session_meta}
+
+**[LOCATION CONTEXT]**
+{location_context}
+
+**[STORE CATALOG]**
+{store_catalog}
+
+**[USER CONTEXT]**
+{user_context}
+
+**[CONVERSATION HISTORY]**
+{conversation_history}
+
+**[CURRENT USER QUERY]**
+{user_query}
+
+**[AGENT IDENTITY]**
+*   **Agent Name:** {agent_name}
+*   **Agent Story:** {agent_story}
+
+**[YOUR RESPONSE FOR THIS TURN]**
+"""
+
+def get_agent_prompt() -> str:
+    """Returns the static master prompt template."""
+    return AGENT_PROMPT
+
+================================================================================
+--- File: cogops/__init__.py ---
+================================================================================
+
+
+
+================================================================================
+--- File: cogops/models/qwen3async_llm.py ---
+================================================================================
+
+# --- START OF FINAL CORRECTED FILE: cogops/models/qwen3async_llm.py ---
+
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, APIError, BadRequestError, APIConnectionError, APITimeoutError
+from typing import Any, Type, TypeVar, AsyncGenerator, List, Dict
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from pydantic import BaseModel, Field
+from cogops.utils.prompt import build_structured_prompt
+from cogops.tools.tools import tools_list, available_tools_map
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+PydanticModel = TypeVar("PydanticModel", bound=BaseModel)
+
+class ContextLengthExceededError(Exception):
+    pass
+
+RETRYABLE_EXCEPTIONS = (APIConnectionError, APITimeoutError)
+
+# --- NEW: Centralized list of all tools that require session_meta ---
+# REASON: This makes the tool-calling logic scalable. To make another tool
+# session-aware, you only need to add its name to this list.
+SESSION_AWARE_TOOLS = [
+    "get_user_order_profile_as_markdown",
+    "get_promotional_products"
+]
+
+def log_retry_attempt(retry_state):
+    logging.warning(
+        f"LLM API call failed with {retry_state.outcome.exception()}, "
+        f"retrying in {retry_state.next_action.sleep} seconds... "
+        f"(Attempt {retry_state.attempt_number})"
+    )
+
+class AsyncLLMService:
+    def __init__(self, api_key: str, model: str, base_url: str, max_context_tokens: int):
+        if not api_key:
+            raise ValueError("API key cannot be empty.")
+        self.model = model
+        self.max_context_tokens = max_context_tokens
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        logging.info(f"✅ AsyncLLMService initialized for model '{self.model}' with max_tokens={self.max_context_tokens}.")
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        before_sleep=log_retry_attempt
+    )
+    async def stream_with_tool_calls(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        available_tools: Dict[str, callable],
+        session_meta: Dict[str, Any],
+        **kwargs: Any
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        try:
+            logging.info("   [Step 1: Streaming model response...]")
+            stream = await self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=tools, tool_choice="auto", stream=True, **kwargs
+            )
+            response_message = {"role": "assistant", "content": "", "tool_calls": []}
+            tool_call_index_map = {}
+            async for chunk in stream:
+                if not chunk.choices: continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield {"type": "answer_chunk", "content": delta.content}
+                    if response_message["content"] is not None:
+                         response_message["content"] += delta.content
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        index = tc_delta.index
+                        if index not in tool_call_index_map:
+                            tool_call_index_map[index] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        if tc_delta.id: tool_call_index_map[index]["id"] += tc_delta.id
+                        if tc_delta.function and tc_delta.function.name: tool_call_index_map[index]["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function and tc_delta.function.arguments: tool_call_index_map[index]["function"]["arguments"] += tc_delta.function.arguments
+            if tool_call_index_map:
+                response_message["tool_calls"] = list(tool_call_index_map.values())
+            tool_calls = response_message["tool_calls"]
+            if not tool_calls:
+                return
+
+            logging.info(f"   [Step 2: Model requested {len(tool_calls)} tool call(s)...]")
+            messages.append(response_message)
+            for tool_call in tool_calls:
+                function_name = tool_call["function"]["name"]
+                yield {"type": "tool_call", "tool_name": function_name}
+                function_to_call = available_tools.get(function_name)
+                if function_to_call:
+                    try:
+                        function_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                        
+                        # --- CRITICAL FIX: Use the generalized list for injection ---
+                        # REASON: The previous hardcoded 'if' statement was not scalable.
+                        # This dynamically checks if the called tool is in our list of
+                        # session-aware tools and injects the context if required.
+                        if function_name in SESSION_AWARE_TOOLS:
+                            function_args['session_meta'] = session_meta
+                        # --- END OF FIX ---
+                            
+                        if asyncio.iscoroutinefunction(function_to_call):
+                            function_response = await function_to_call(**function_args)
+                        else:
+                            function_response = await asyncio.to_thread(function_to_call, **function_args)
+                        messages.append({"tool_call_id": tool_call["id"], "role": "tool", "name": function_name, "content": str(function_response)})
+                    except Exception as e:
+                        logging.error(f"Error executing tool '{function_name}': {e}", exc_info=True)
+                        messages.append({"tool_call_id": tool_call["id"], "role": "tool", "name": function_name, "content": f"Error: Tool execution failed."})
+                else:
+                    logging.warning(f"Model tried to call an unknown tool: {function_name}")
+
+            logging.info("   [Step 3: Streaming final answer...]")
+            final_stream = await self.client.chat.completions.create(
+                model=self.model, messages=messages, stream=True, **kwargs
+            )
+            async for chunk in final_stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield {"type": "answer_chunk", "content": chunk.choices[0].delta.content}
+        except BadRequestError as e:
+            if "context length" in str(e).lower() or "too large" in str(e).lower():
+                logging.error(f"FATAL: Prompt exceeded context window.")
+                yield {"type": "error", "content": "Conversation too long. Please start a new session."}
+                raise ContextLengthExceededError(f"Prompt is too long.") from e
+            else:
+                logging.error(f"A non-retryable bad request error occurred: {e}", exc_info=True)
+                yield {"type": "error", "content": "There was an issue processing your request."}
+                raise
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during streaming tool invocation: {e}", exc_info=True)
+            yield {"type": "error", "content": "An internal error occurred."}
+            raise
+
+# --- END OF FINAL CORRECTED FILE: cogops/models/qwen3async_llm.py ---
+
+================================================================================
+--- File: cogops/models/embGemma_embedder.py ---
+================================================================================
+
+import json
+import logging
+from typing import Any, Dict, List
+import numpy as np
+import requests
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+from pydantic import BaseModel, Field
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+QUERY_PREFIX = "task: search result | query: "
+PASSAGE_PREFIX = "title: none | text: "
+
+class GemmaTritonEmbedderConfig(BaseModel):
+    """Configuration for the GemmaTritonEmbedder."""
+    triton_url: str = Field(description="Base URL for the Triton Inference Server")
+    triton_request_timeout: int = Field(default=480, description="Request timeout in seconds.")
+    model_name: str = Field(default="gemma_embedding", description="Name of the model in Triton.")
+    tokenizer_name: str = Field(default="onnx-community/embeddinggemma-300m-ONNX", description="HF tokenizer name.")
+    triton_output_name: str = Field(default="sentence_embedding", description="Name of the output tensor.")
+    batch_size: int = Field(default=8, description="Batch size for embedding requests sent to Triton.")
+
+class _SyncGemmaTritonEmbedder:
+    """Internal synchronous client that handles communication with Triton."""
+    def __init__(self, config: GemmaTritonEmbedderConfig):
+        self.config = config
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+
+    def _build_triton_payload(self, texts: List[str]) -> Dict[str, Any]:
+        """Prepares the request payload for Triton."""
+        tokens = self.tokenizer(texts, padding=True, truncation=True, max_length=2048, return_tensors="np")
+        input_ids = tokens["input_ids"].astype(np.int64)
+        attention_mask = tokens["attention_mask"].astype(np.int64)
+        payload = {
+            "inputs": [
+                {"name": "input_ids", "shape": list(input_ids.shape), "datatype": "INT64", "data": input_ids.flatten().tolist()},
+                {"name": "attention_mask", "shape": list(attention_mask.shape), "datatype": "INT64", "data": attention_mask.flatten().tolist()},
+            ],
+            "outputs": [{"name": self.config.triton_output_name}],
+        }
+        return payload
+
+    def _post_process(self, triton_output: Dict[str, Any]) -> List[List[float]]:
+        """Extracts the pooled embeddings from the Triton output."""
+        output_data = next((out for out in triton_output["outputs"] if out["name"] == self.config.triton_output_name), None)
+        if output_data is None:
+            raise ValueError(f"Output '{self.config.triton_output_name}' not in Triton response.")
+        
+        shape = output_data["shape"]
+        embeddings = np.array(output_data["data"], dtype=np.float32).reshape(shape)
+        return embeddings.tolist()
+
+    def embed(self, texts: List[str], model_name: str) -> List[List[float]]:
+        """Creates embeddings for a list of texts using a synchronous request."""
+        if not texts:
+            return []
+        api_url = f"{self.config.triton_url.rstrip('/')}/v2/models/{model_name}/infer"
+        payload = self._build_triton_payload(texts)
+        try:
+            response = requests.post(
+                api_url, 
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=self.config.triton_request_timeout
+            )
+            response.raise_for_status()
+            response_json = response.json()
+            return self._post_process(response_json)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error embedding texts with model {model_name}: {e}", exc_info=True)
+            raise
+
+class GemmaTritonEmbedder:
+    """A synchronous client for EmbeddingGemma on Triton with separate query and passage embedding via prefixes."""
+    def __init__(self, config: GemmaTritonEmbedderConfig):
+        self.config = config
+        self._client = _SyncGemmaTritonEmbedder(config)
+        logger.info(f"Embedder initialized for Triton at {config.triton_url} with batch size {config.batch_size}")
+
+    def embed_queries(self, texts: List[str]) -> List[List[float]]:
+        """Embeds a batch of queries using the query prefix."""
+        if not isinstance(texts, list) or not texts:
+            return []
+        texts_with_prefix = [QUERY_PREFIX + t for t in texts]
+        all_embeddings = []
+        for i in range(0, len(texts_with_prefix), self.config.batch_size):
+            batch = texts_with_prefix[i : i + self.config.batch_size]
+            logger.info(f"Sending query batch of {len(batch)} to Triton...")
+            batch_embeddings = self._client.embed(batch, self.config.model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    def embed_passages(self, texts: List[str]) -> List[List[float]]:
+        """Embeds a batch of documents/passages using the passage prefix."""
+        if not isinstance(texts, list) or not texts:
+            return []
+        texts_with_prefix = [PASSAGE_PREFIX + t for t in texts]
+        all_embeddings = []
+        for i in range(0, len(texts_with_prefix), self.config.batch_size):
+            batch = texts_with_prefix[i : i + self.config.batch_size]
+            logger.info(f"Sending passage batch of {len(batch)} to Triton...")
+            batch_embeddings = self._client.embed(batch, self.config.model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    def as_chroma_passage_embedder(self) -> EmbeddingFunction:
+        """Returns an object that conforms to ChromaDB's EmbeddingFunction protocol."""
+        class ChromaPassageEmbedder(EmbeddingFunction):
+            def __init__(self, client: 'GemmaTritonEmbedder'):
+                self._client = client
+            def __call__(self, input: Documents) -> Embeddings:
+                return self._client.embed_passages(input)
+        return ChromaPassageEmbedder(self)
+
+    def close(self):
+        logger.info("Closing embedder (no-op for synchronous requests version).")
+        pass
+
+================================================================================
+--- File: cogops/retriver/vector_search.py ---
+================================================================================
+
+import os
+import yaml
+import chromadb
+import logging
+import asyncio
+from collections import defaultdict
+from dotenv import load_dotenv
+from typing import List, Dict, Optional, Any, Tuple
+
+# --- Custom Module Imports ---
+# Adjust these paths based on your actual project structure
+from cogops.models.embGemma_embedder import GemmaTritonEmbedder, GemmaTritonEmbedderConfig
+from cogops.retriver.db import SQLDatabaseManager
+from cogops.utils.db_config import get_postgres_config
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Load Environment Variables ---
+load_dotenv()
+POSTGRES_CONFIG = get_postgres_config()
+
+class VectorRetriever:
+    """
+    Retrieves and ranks documents by first querying multiple vector collections in ChromaDB,
+    fusing the results using RRF to get the top passage IDs, and then fetching the
+    full passage content from a PostgreSQL database.
+    """
+    def __init__(self, config_path: str = "configs/config.yaml"):
+        logging.info("Initializing VectorRetriever...")
+        full_config = self._load_config(config_path)
+        retriever_config = full_config.get("vector_retriever")
+        if not retriever_config:
+            raise ValueError(f"Config file '{config_path}' is missing 'vector_retriever' section.")
+
+        # --- Load configuration ---
+        self.top_k = retriever_config.get("top_k", 10)
+        self.collection_names = retriever_config.get("collections", [])
+        self.max_passages_to_select = retriever_config.get("max_passages_to_select", 3)
+        self.rrf_k = retriever_config.get("rrf_k", 60)
+        self.passage_id_key = retriever_config.get("passage_id_meta_key", "passage_id")
+
+        if not self.collection_names:
+            raise ValueError("Config missing 'collections' key.")
+
+        # --- Initialize clients and embedder ---
+        self.chroma_client = self._connect_to_chroma()
+        self.db_manager = SQLDatabaseManager(POSTGRES_CONFIG)
+        self.embedder = self._initialize_embedder()
+
+        # Get handles to all required ChromaDB collections
+        self.collections = {
+            name: self.chroma_client.get_collection(name=name) for name in self.collection_names
+        }
+        logging.info(f"VectorRetriever initialized. Will select top {self.max_passages_to_select} passages after RRF.")
+
+    def _load_config(self, config_path: str) -> Dict:
+        logging.info(f"Loading configuration from: {config_path}")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            logging.error(f"Configuration file not found at: {config_path}")
+            raise
+
+    def _connect_to_chroma(self) -> chromadb.HttpClient:
+        CHROMA_HOST = os.environ.get("CHROMA_DB_HOST", "localhost")
+        CHROMA_PORT = int(os.environ.get("CHROMA_DB_PORT", 8000))
+        logging.info(f"Connecting to ChromaDB at {CHROMA_HOST}:{CHROMA_PORT}...")
+        try:
+            client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+            client.heartbeat()
+            logging.info("✅ ChromaDB connection successful!")
+            return client
+        except Exception as e:
+            logging.error(f"Failed to connect to ChromaDB: {e}", exc_info=True)
+            raise
+
+    def _initialize_embedder(self) -> GemmaTritonEmbedder:
+        TRITON_URL = os.environ.get("TRITON_EMBEDDER_URL", "http://localhost:6000")
+        logging.info(f"Initializing GemmaTritonEmbedder with Triton at: {TRITON_URL}")
+        embedder_config = GemmaTritonEmbedderConfig(triton_url=TRITON_URL)
+        return GemmaTritonEmbedder(config=embedder_config)
+
+    async def _query_collection_async(
+        self,
+        collection_name: str,
+        query_embedding: List[float],
+        top_k: int
+    ) -> List[Tuple[int, int]]:
+        """
+        Queries a single collection and returns a list of (passage_id, rank) tuples.
+        """
+        collection = self.collections[collection_name]
+        try:
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["metadatas"]
+            )
+            
+            ranked_results = []
+            if results and results['metadatas'] and results['metadatas'][0]:
+                for i, meta in enumerate(results['metadatas'][0]):
+                    passage_id_val = meta.get(self.passage_id_key)
+                    if passage_id_val is not None:
+                        try:
+                            passage_id = int(passage_id_val)
+                            rank = i + 1
+                            ranked_results.append((passage_id, rank))
+                        except (ValueError, TypeError):
+                            logging.warning(f"In collection '{collection_name}', could not convert passage_id '{passage_id_val}' to int. Skipping.")
+            return ranked_results
+        except Exception as e:
+            logging.error(f"Error querying {collection_name}: {e}")
+            return []
+
+    async def retrieve_passages(
+        self,
+        query: str,
+        top_k_per_collection: int = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Performs the end-to-end retrieval process.
+        
+        1. Embeds the query.
+        2. Queries all vector collections concurrently.
+        3. Fuses the results using RRF to rank passage IDs.
+        4. Selects the top N passage IDs.
+        5. Fetches the full passage data for these IDs from PostgreSQL.
+        
+        Returns:
+            A list of dictionaries, each containing passage details, ordered by RRF score.
+        """
+        if top_k_per_collection is None:
+            top_k_per_collection = self.top_k
+
+        logging.info(f"Starting retrieval for query: '{query}'")
+        
+        # Step 1: Embed the query
+        query_embedding = self.embedder.embed_queries([query])[0]
+
+        # Step 2: Query all collections in parallel
+        tasks = [
+            self._query_collection_async(name, query_embedding, top_k_per_collection)
+            for name in self.collection_names
+        ]
+        list_of_ranked_lists = await asyncio.gather(*tasks)
+
+        # Step 3: Apply Reciprocal Rank Fusion
+        fused_scores = defaultdict(float)
+        for ranked_list in list_of_ranked_lists:
+            for passage_id, rank in ranked_list:
+                fused_scores[passage_id] += 1.0 / (self.rrf_k + rank)
+        
+        if not fused_scores:
+            logging.warning("No passages found after querying all vector collections.")
+            return []
+
+        # Step 4: Sort by RRF score and select the top passage IDs
+        sorted_passage_ids = sorted(
+            fused_scores.keys(),
+            key=lambda pid: fused_scores[pid],
+            reverse=True
+        )
+        top_passage_ids = sorted_passage_ids[:self.max_passages_to_select]
+        logging.info(f"RRF found {len(fused_scores)} unique passages. Selecting top {len(top_passage_ids)} IDs for retrieval.")
+
+        if not top_passage_ids:
+            return []
+
+        # Step 5: Fetch full passage data from PostgreSQL
+        try:
+            logging.info(f"Fetching full data for IDs from PostgreSQL: {top_passage_ids}")
+            passages_df = self.db_manager.select_passages_by_ids(top_passage_ids)
+            
+            if passages_df.empty:
+                logging.warning(f"PostgreSQL query returned no data for IDs: {top_passage_ids}")
+                return []
+
+            # Convert DataFrame to a dictionary for efficient, ordered lookup
+            passage_map = {row['passage_id']: row.to_dict() for index, row in passages_df.iterrows()}
+
+            # Re-order the results from the database to match the RRF ranking
+            final_ordered_passages = []
+            for pid in top_passage_ids:
+                if pid in passage_map:
+                    final_ordered_passages.append(passage_map[pid])
+            
+            return final_ordered_passages
+
+        except Exception as e:
+            logging.error(f"Failed to retrieve passages from PostgreSQL. Error: {e}", exc_info=True)
+            return []
+
+    def close(self):
+        """Cleanly closes any open connections."""
+        if self.embedder:
+            self.embedder.close()
+            logging.info("Embedder connection closed.")
+
+async def main():
+    """Main function to test the VectorRetriever."""
+    retriever = None
+    try:
+        retriever = VectorRetriever(config_path="configs/config.yaml")
+        user_query = "আমার এন আই ডি হারায়ে গেছে রাস্তায়"
+        
+        print(f"\n--- Testing retrieval for query: '{user_query}' ---")
+        passages = await retriever.retrieve_passages(user_query)
+        
+        if passages:
+            print(f"\nRetrieved {len(passages)} passages from PostgreSQL, sorted by relevance:")
+            for i, passage in enumerate(passages):
+                print("-" * 20)
+                print(f"Rank {i+1}:")
+                print(f"  Passage ID: {passage.get('passage_id')}")
+                print(f"  URL: {passage.get('url')}")
+                print(f"  Date: {passage.get('date')}")
+                print(f"  Text: '{str(passage.get('text'))[:150]}...'")
+        else:
+            print("\nNo passages were retrieved for the query.")
+            
+    except Exception as e:
+        logging.error(f"An error occurred in the main execution: {e}", exc_info=True)
+    finally:
+        if retriever:
+            retriever.close()
+        logging.info("\n--- Script Finished ---")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+--- File: cogops/retriver/db.py ---
+================================================================================
+
+# --- START OF MODIFIED FILE: cogops/retriver/db.py ---
+
+import sys
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from loguru import logger
+from typing import List, Dict
+
+import psycopg2
+from psycopg2.extensions import register_adapter, AsIs
+
+from sqlalchemy import (
+    create_engine,
+    select,
+    insert,
+    delete,
+    update,
+    Text,
+    Date,
+    String,
+    Integer,
+    ForeignKey,
+    DateTime,
+    func
+)
+from sqlalchemy.dialects.postgresql import insert as pg_insert, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# --- Numpy Datatype Adapters for psycopg2 ---
+# Prevents errors when inserting numpy data types into PostgreSQL.
+def addapt_numpy_float64(numpy_float64):
+    return AsIs(numpy_float64)
+def addapt_numpy_int64(numpy_int64):
+    return AsIs(numpy_int64)
+
+register_adapter(np.float64, addapt_numpy_float64)
+register_adapter(np.int64, addapt_numpy_int64)
+
+
+# --- ORM Declarative Base ---
+# All of our table models will inherit from this class.
+class Base(DeclarativeBase):
+    """Base class for SQLAlchemy ORM models."""
+    pass
+
+
+# --- Passages Table Schema Definition (Existing) ---
+class Passages(Base):
+    """
+    Defines the schema for the 'passages' table, which stores the RAG knowledge base.
+    """
+    __tablename__ = "passages"
+    passage_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    topic: Mapped[str] = mapped_column(String, nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    date: Mapped[datetime.date] = mapped_column(Date, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"Passages(passage_id={self.passage_id!r}, topic={self.topic!r})"
+
+
+# --- Sessions Table Schema Definition (NEW) ---
+class Sessions(Base):
+    """
+    NEW: Defines the schema for the 'sessions' table.
+    REASON: Provides a permanent record of every chat session, including user
+    and store context, and tracking creation/deletion times for analytics.
+    """
+    __tablename__ = "sessions"
+    session_id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, nullable=True)
+    store_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Establishes a one-to-many relationship with ConversationHistory
+    history: Mapped[List["ConversationHistory"]] = relationship(back_populates="session")
+
+    def __repr__(self) -> str:
+        return f"Sessions(session_id={self.session_id!r}, user_id={self.user_id!r})"
+
+
+# --- Conversation History Table Schema Definition (NEW) ---
+class ConversationHistory(Base):
+    """
+    NEW: Defines the schema for the 'conversation_history' table.
+    REASON: This is the permanent, append-only log of every message exchanged.
+    It is the backbone for the history retrieval API and for auditing.
+    """
+    __tablename__ = "conversation_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("sessions.session_id"),
+        nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # 'user' or 'assistant'
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Establishes a many-to-one relationship with Sessions
+    session: Mapped["Sessions"] = relationship(back_populates="history")
+
+    def __repr__(self) -> str:
+        return f"ConversationHistory(id={self.id!r}, session_id={self.session_id!r}, role={self.role!r})"
+
+
+# --- Database Management Class ---
+class SQLDatabaseManager():
+    """
+    Manages the connection and CRUD operations for all tables
+    in the PostgreSQL database.
+    """
+    def __init__(self, database_config: dict) -> None:
+        """Initializes the database manager and connects to the database."""
+        self.config = database_config
+        self.engine = self._create_engine()
+        # Keep a reference to the table objects for convenience
+        self.passages_table = Passages.__table__
+        self.sessions_table = Sessions.__table__
+        self.history_table = ConversationHistory.__table__
+
+    def _create_engine(self):
+        """Creates and returns a SQLAlchemy engine."""
+        try:
+            conn_url = 'postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}'.format(**self.config)
+            return create_engine(conn_url, echo=self.config.get('echo', False))
+        except Exception as exc:
+            logger.error(f"Could not create database engine: {exc}")
+            sys.exit(-1)
+
+    # --- Methods for 'passages' table ---
+    def upsert_passages(self, insert_data: List[Dict], update_columns: List[str]) -> int:
+        """Inserts new passages or updates them on primary key conflict."""
+        if not insert_data:
+            return 0
+        try:
+            pk = [key.name for key in self.passages_table.primary_key]
+            stmt = pg_insert(self.passages_table).values(insert_data)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=pk,
+                set_={col: getattr(stmt.excluded, col) for col in update_columns}
+            )
+            with self.engine.connect() as conn:
+                conn.execute(stmt)
+                conn.commit()
+            logger.info(f"Successfully upserted {len(insert_data)} passages.")
+            return 0
+        except Exception as exc:
+            logger.error(f"An error occurred during UPSERT into passages: {exc}")
+            sys.exit(-1)
+
+    def select_passages_by_ids(self, passage_ids: List[int]) -> pd.DataFrame:
+        """Selects passages from the table by a list of passage_ids."""
+        if not passage_ids:
+            return pd.DataFrame()
+        stmt = select(self.passages_table).where(self.passages_table.c.passage_id.in_(passage_ids))
+        try:
+            with self.engine.connect() as conn:
+                return pd.read_sql(stmt, conn)
+        except Exception as exc:
+            logger.error(f"An error occurred during SELECT_BY_IDS from passages: {exc}")
+            sys.exit(-1)
+
+    # NOTE: Other methods like insert, update, delete for passages can remain if needed.
+
+# --- END OF MODIFIED FILE: cogops/retriver/db.py ---
+
+================================================================================
+--- File: cogops/utils/token_manager.py ---
+================================================================================
+
+# --- START OF FINAL CORRECTED FILE: cogops/utils/token_manager.py ---
+
+import logging
+from transformers import AutoTokenizer
+from typing import List, Tuple, Dict, Any, Union
+
+class TokenManager:
+    """
+    A utility class for managing token counts and truncating prompts to fit
+    within a model's context window.
+    """
+    def __init__(self, model_name: str, reservation_tokens: int, history_budget: float):
+        """
+        Initializes the tokenizer and configuration for prompt building.
+        """
+        logging.info(f"Initializing TokenManager with tokenizer from '{model_name}'...")
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.reservation_tokens = reservation_tokens
+            self.history_budget = history_budget
+            logging.info(f"✅ TokenManager initialized. Reservation: {reservation_tokens} tokens, History Budget: {history_budget*100}%.")
+        except Exception as e:
+            logging.critical(f"FATAL: Could not initialize tokenizer for '{model_name}'. Error: {e}")
+            raise
+
+    def count_tokens(self, text: str) -> int:
+        """Counts the number of tokens in a given string."""
+        if not text:
+            return 0
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def _truncate_history(self, history: List[Tuple[str, str]], max_tokens: int) -> str:
+        """
+        Truncates conversation history from oldest to newest to fit the token budget.
+        Returns a formatted string of the truncated history.
+        """
+        if not history:
+            return "No conversation history yet."
+            
+        truncated_history = list(history)
+        while truncated_history:
+            # The format here MUST match the one expected in the prompt
+            formatted_history = "\n---\n".join([f"User: {u}\nAssistant: {a}" for u, a in truncated_history])
+            if self.count_tokens(formatted_history) <= max_tokens:
+                if len(truncated_history) < len(history):
+                    logging.warning(f"History truncated from {len(history)} to {len(truncated_history)} turns to fit token budget.")
+                return formatted_history
+            truncated_history.pop(0) # Remove the oldest turn
+        
+        logging.warning("History is too long to be included in this turn's context, even after truncation.")
+        return "History is too long to be included in this turn's context."
+
+    def build_safe_prompt(self, template: str, max_tokens: int, **kwargs: Any) -> str:
+        """
+        Builds a prompt from a template and its components, ensuring it does not
+        exceed the maximum token limit through intelligent truncation of dynamic content.
+        """
+        available_content_tokens = max_tokens - self.reservation_tokens
+
+        tokens_used = 0
+        final_components = {}
+        
+        for key, value in kwargs.items():
+            # Exclude keys for dynamic, truncatable content from the initial token count.
+            if key not in ['history']:
+                str_value = str(value)
+                final_components[key] = str_value
+                tokens_used += self.count_tokens(str_value)
+        
+        remaining_tokens = available_content_tokens - tokens_used
+        if remaining_tokens < 0:
+            logging.error(f"Static components alone ({tokens_used} tokens) exceed the available budget. Prompt will be severely truncated.")
+            remaining_tokens = 0
+
+        history_str = "No conversation history yet."
+        if 'history' in kwargs and kwargs['history']:
+            history_budget_tokens = int(remaining_tokens * self.history_budget)
+            history_str = self._truncate_history(kwargs['history'], history_budget_tokens)
+        
+        # --- CRITICAL FIX REVERTED AND CORRECTED ---
+        # My previous correction was an error. After reviewing your `prompt.py`, the placeholder
+        # is indeed `{conversation_history}`. This restores the correct key.
+        final_components['conversation_history'] = history_str
+        # We no longer need the incorrect 'history' key.
+        if 'history' in final_components:
+            del final_components['history']
+        # --- END OF FIX ---
+        
+        try:
+            # We now must provide a value for the `{history}` placeholder that was in the kwargs,
+            # even though it's not in the final prompt template. The .format method requires it.
+            # We pass an empty string for any keys that were in kwargs but not in the final dict.
+            # A cleaner way is to ensure all kwargs keys are present. Let's do that.
+            # Add back the original history from kwargs to satisfy the formatter.
+            final_components['history'] = kwargs.get('history', [])
+
+            final_prompt = template.format(**final_components)
+        except KeyError as e:
+            # This logic is now more robust.
+            # Let's ensure all expected keys from the prompt template are present.
+            # Forcing a default for `conversation_history` if not set.
+            final_components.setdefault('conversation_history', "No conversation history yet.")
+            final_prompt = template.format(**{k: v for k, v in final_components.items() if f"{{{k}}}" in template})
+            logging.warning(f"A minor key mismatch was handled during prompt formatting. Missing key was likely: {e}")
+
+        total_tokens = self.count_tokens(final_prompt)
+        if total_tokens > max_tokens:
+            logging.warning(f"Prompt exceeded budget after final assembly ({total_tokens}/{max_tokens}). Performing hard truncation.")
+            encoded_prompt = self.tokenizer.encode(final_prompt)
+            truncated_encoded = encoded_prompt[:max_tokens]
+            final_prompt = self.tokenizer.decode(truncated_encoded, skip_special_tokens=True)
+            
+        return final_prompt
+
+# --- END OF FINAL CORRECTED FILE: cogops/utils/token_manager.py ---
+
+================================================================================
+--- File: cogops/utils/prompt.py ---
+================================================================================
+
+import json
+from typing import Type
+from pydantic import BaseModel
+
+def build_structured_prompt(prompt: str, response_model: Type[BaseModel]) -> str:
+    """
+    Constructs a standardized prompt for forcing a model to generate a
+    JSON object that conforms to a given Pydantic model's schema.
+    
+    Args:
+        prompt (str): The core user prompt or request.
+        response_model (Type[BaseModel]): The Pydantic model for the desired output.
+
+    Returns:
+        str: A fully formatted prompt ready for an LLM.
+    """
+    # Generate the JSON schema from the Pydantic model.
+    schema = json.dumps(response_model.model_json_schema(), indent=2)
+
+    # Engineer a new prompt that includes the original prompt and instructions.
+    structured_prompt = f"""
+    Given the following request:
+    ---
+    {prompt}
+    ---
+    Your task is to provide a response as a single, valid JSON object that strictly adheres to the following JSON Schema.
+    Do not include any extra text, explanations, or markdown formatting (like ```json) outside of the JSON object itself.
+
+    JSON Schema:
+    {schema}
+    """
+    return structured_prompt
+
+================================================================================
+--- File: cogops/utils/db_config.py ---
+================================================================================
+
+import os
+import sys
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load environment variables from a .env file
+load_dotenv()
+
+import os
+import sys
+from dotenv import load_dotenv
+from loguru import logger
+
+# Load environment variables from a .env file in the current directory or parent directories
+load_dotenv()
+
+def get_postgres_config():
+    """
+    Loads PostgreSQL configuration from environment variables.
+    Exits the application if any required variable is missing.
+    """
+    # This mapping ensures the correct keys are created for the SQLAlchemy engine.
+    key_map = {
+        "POSTGRES_HOST": "host",
+        "POSTGRES_PORT": "port",
+        "POSTGRES_USER": "user",
+        "POSTGRES_PASSWORD": "password",
+        "POSTGRES_DB": "database",  # <-- This is the corrected key
+    }
+
+    config = {key: os.getenv(env_var) for env_var, key in key_map.items()}
+
+    # Validate that all required variables were found in the .env file
+    missing = [env_var for env_var, key in key_map.items() if not config[key]]
+    if missing:
+        logger.error(f"Missing required environment variables: {missing}")
+        sys.exit("Exiting: Database configuration is incomplete.")
+        
+    logger.info("PostgreSQL configuration loaded successfully.")
+    return config
+
+
+
+================================================================================
+--- File: cogops/utils/redis_manager.py ---
+================================================================================
+
+# --- START OF FINAL CORRECTED FILE: cogops/utils/redis_manager.py ---
+
+import os
+import json
+import logging
+from typing import Dict, Any, Optional, List, Tuple
+
+import redis.asyncio as aioredis
+from redis.asyncio.connection import ConnectionPool
+
+# --- Configuration ---
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+SESSION_TTL_SECONDS = 48 * 60 * 60  # 48 hours
+HISTORY_MAX_LENGTH = 20  # Keep the last 10 user/assistant pairs
+
+class RedisManager:
+    """
+    A singleton-like class to manage a single, application-wide Redis connection pool.
+    This centralized manager handles all interactions with Redis for session data
+    and conversation history, ensuring consistency and efficient connection management.
+    """
+    _pool: Optional[ConnectionPool] = None
+
+    @classmethod
+    def _get_pool(cls) -> ConnectionPool:
+        """Initializes or returns the existing Redis connection pool."""
+        if cls._pool is None:
+            logging.info(f"Initializing Redis connection pool at {REDIS_HOST}:{REDIS_PORT}...")
+            cls._pool = ConnectionPool(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                db=0,
+                decode_responses=True,
+                max_connections=50
+            )
+            logging.info("✅ Redis connection pool initialized.")
+        return cls._pool
+
+    @classmethod
+    def get_client(cls) -> aioredis.Redis:
+        """Provides a Redis client instance from the shared connection pool."""
+        return aioredis.Redis(connection_pool=cls._get_pool())
+
+    @classmethod
+    async def create_session(cls, session_id: str, session_meta: Dict[str, Any]) -> None:
+        """
+        Creates a new session hash in Redis, sanitizing input to prevent errors.
+        """
+        client = cls.get_client()
+
+        # --- CRITICAL FIX: Sanitize the mapping to prevent DataError. ---
+        # REASON: The redis client cannot serialize 'None'. We MUST convert any
+        # None values to a storable format (like an empty string) before writing.
+        # This makes the manager robust to the frontend sending None values.
+        sanitized_meta = {
+            str(k): (str(v) if v is not None else "") for k, v in session_meta.items()
+        }
+
+        async with client.pipeline() as pipe:
+            await pipe.hset(f"session:{session_id}", mapping=sanitized_meta)
+            await pipe.expire(f"session:{session_id}", SESSION_TTL_SECONDS)
+            await pipe.execute()
+        logging.info(f"Created new Redis session: {session_id}")
+
+    @classmethod
+    async def get_session(cls, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a session hash from Redis."""
+        client = cls.get_client()
+        return await client.hgetall(f"session:{session_id}")
+
+    @classmethod
+    async def append_to_history(cls, session_id: str, user_message: str, assistant_message: str) -> None:
+        """Appends a conversation turn to the Redis history list."""
+        client = cls.get_client()
+        user_turn = json.dumps({"role": "user", "content": user_message})
+        assistant_turn = json.dumps({"role": "assistant", "content": assistant_message})
+
+        async with client.pipeline() as pipe:
+            await pipe.lpush(f"history:{session_id}", assistant_turn, user_turn)
+            await pipe.ltrim(f"history:{session_id}", 0, HISTORY_MAX_LENGTH - 1)
+            await pipe.expire(f"history:{session_id}", SESSION_TTL_SECONDS)
+            await pipe.execute()
+
+    @classmethod
+    async def get_history(cls, session_id: str) -> List[Tuple[str, str]]:
+        """Retrieves and reconstructs recent conversation history from Redis."""
+        client = cls.get_client()
+        history_json = await client.lrange(f"history:{session_id}", 0, -1)
+        if not history_json:
+            return []
+
+        history_json.reverse()
+        history = []
+        for i in range(0, len(history_json), 2):
+            try:
+                user_turn = json.loads(history_json[i])
+                if i + 1 < len(history_json):
+                    assistant_turn = json.loads(history_json[i+1])
+                    if user_turn['role'] == 'user' and assistant_turn['role'] == 'assistant':
+                        history.append((user_turn['content'], assistant_turn['content']))
+            except (json.JSONDecodeError, KeyError) as e:
+                logging.warning(f"Could not parse history item for session {session_id}: {e}")
+        return history
+
+    @classmethod
+    async def delete_session(cls, session_id: str) -> None:
+        """Deletes all Redis keys for a given session."""
+        client = cls.get_client()
+        await client.delete(f"session:{session_id}", f"history:{session_id}")
+        logging.info(f"Deleted Redis data for session: {session_id}")
+
+    @classmethod
+    async def close_pool(cls) -> None:
+        """Closes the Redis connection pool on application shutdown."""
+        if cls._pool:
+            logging.info("Closing Redis connection pool.")
+            await cls._pool.disconnect()
+            cls._pool = None
+
+# Create a single instance for the application to use.
+redis_manager = RedisManager()
+
+# --- END OF FINAL CORRECTED FILE: cogops/utils/redis_manager.py ---
+
+================================================================================
+--- File: cogops/utils/private_api.py ---
+================================================================================
+
+# --- START OF MODIFIED FILE: cogops/utils/private_api.py ---
+
+import os
+import requests
+import logging
+from typing import Dict, Any, Optional
+
+# --- NEW: Import tenacity for robust retry logic ---
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+
+# --- NEW: Define the exception type that should trigger a retry ---
+# REASON: We only want to retry on network-level failures, not on HTTP
+# client or server errors (like 4xx or 5xx), which are handled separately.
+RETRYABLE_EXCEPTIONS = (requests.exceptions.RequestException,)
+
+# --- NEW: Define a logging function for tenacity to use before retrying ---
+def log_private_api_retry_attempt(retry_state):
+    """Logs a warning message before a retry attempt for the private API."""
+    # Extract the endpoint from the function's arguments for a more informative log.
+    endpoint = retry_state.args[0] if retry_state.args else "unknown_endpoint"
+    logging.warning(
+        f"Private API call to '{endpoint}' failed with {retry_state.outcome.exception()}, "
+        f"retrying in {retry_state.next_action.sleep} seconds... "
+        f"(Attempt {retry_state.attempt_number})"
+    )
+
+# --- CRITICAL CHANGE: Added retry decorator ---
+# REASON: Makes all internal API calls resilient to transient network failures,
+# improving the reliability of all tools that depend on this function.
+@retry(
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+    before_sleep=log_private_api_retry_attempt
+)
+def make_private_request(endpoint: str, session_meta: Dict[str, Any], method: str = 'GET', payload: Optional[Dict] = None) -> Optional[Dict]:
+    """
+    Handles authenticated requests by sending both access and refresh tokens in the headers.
+    This function is now hardened with automatic retries for network errors.
+    """
+    access_token = session_meta.get('access_token')
+    refresh_token = session_meta.get('refresh_token')
+
+    if not all([access_token, refresh_token]):
+        logging.error(f"Missing auth tokens for private API call to {endpoint}.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "refreshToken": refresh_token,
+        "Content-Type": "application/json"
+    }
+    api_url = f"{BASE_URL}/{endpoint}"
+    
+    try:
+        if method == 'GET':
+            response = requests.get(api_url, headers=headers, timeout=15)
+        elif method == 'POST':
+            response = requests.post(api_url, headers=headers, json=payload, timeout=15)
+        else:
+            # Should not happen, but good practice to handle.
+            logging.error(f"Unsupported HTTP method '{method}' for make_private_request.")
+            return None
+            
+        # This will raise an HTTPError for 4xx or 5xx responses.
+        # The retry logic will NOT catch this, which is the desired behavior.
+        response.raise_for_status()
+        return response.json()
+        
+    except requests.exceptions.HTTPError as e:
+        # Log specific HTTP errors (e.g., 401 Unauthorized, 404 Not Found, 500 Server Error)
+        # These are not retried because the problem is not transient.
+        logging.error(f"HTTP error for {endpoint}: {e} - Response: {e.response.text}")
+        return None
+    except requests.exceptions.RequestException as e:
+        # This block will now only be hit if the retry attempts are exhausted.
+        logging.error(f"Request failed for {endpoint} after multiple retries: {e}")
+        # Re-raise the exception to be handled by the tenacity decorator.
+        raise
+
+# --- END OF MODIFIED FILE: cogops/utils/private_api.py ---
+
+================================================================================
+--- File: cogops/tasks/cleanup.py ---
+================================================================================
+
+# --- START OF FINAL CORRECTED FILE: cogops/tasks/cleanup.py ---
+
+import logging
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy import select, delete
+
+from cogops.retriver.db import Sessions, ConversationHistory
+# NOTE: redis_manager is not needed here as we are now only handling PostgreSQL cleanup.
+# Redis keys are deleted immediately on /clear_session and have their own TTL.
+
+PURGE_GRACE_PERIOD_MINUTES = 60
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# CRITICAL FIX: The function is now SYNCHRONOUS.
+# REASON: All SQLAlchemy session operations within are blocking.
+# This function is intended to be run in a separate thread to avoid blocking the main async loop.
+def purge_deleted_sessions_sync(db: Session):
+    """
+    Finds and permanently deletes session data from PostgreSQL for sessions
+    that were soft-deleted more than the grace period ago.
+    """
+    logging.info("Starting synchronous cleanup task: Purging old soft-deleted sessions...")
+
+    # Calculate the cutoff time for purging.
+    cutoff_time = datetime.utcnow() - timedelta(minutes=PURGE_GRACE_PERIOD_MINUTES)
+
+    try:
+        # 1. Find all session IDs that are ready to be purged from PostgreSQL.
+        stmt = select(Sessions.session_id).where(
+            Sessions.deleted_at != None,
+            Sessions.deleted_at < cutoff_time
+        )
+        sessions_to_purge = db.execute(stmt).scalars().all()
+
+        if not sessions_to_purge:
+            logging.info("Cleanup task finished: No sessions to purge.")
+            return
+
+        logging.info(f"Found {len(sessions_to_purge)} sessions to permanently delete.")
+
+        # 2. Delete the data from PostgreSQL in a single transaction.
+        # This is more efficient than deleting one by one.
+
+        # Delete from the 'conversation_history' table first due to the foreign key constraint.
+        history_delete_stmt = delete(ConversationHistory).where(ConversationHistory.session_id.in_(sessions_to_purge))
+        history_result = db.execute(history_delete_stmt)
+
+        # Then, delete from the 'sessions' table.
+        session_delete_stmt = delete(Sessions).where(Sessions.session_id.in_(sessions_to_purge))
+        session_result = db.execute(session_delete_stmt)
+        
+        db.commit()
+        logging.info(f"Purged {history_result.rowcount} history records and {session_result.rowcount} session records from PostgreSQL.")
+
+    except Exception as e:
+        logging.error(f"Failed to purge sessions from PostgreSQL: {e}", exc_info=True)
+        db.rollback() # Roll back the transaction on failure.
+
+    logging.info("✅ Synchronous cleanup task finished.")
+
+
+# --- END OF FINAL CORRECTED FILE: cogops/tasks/cleanup.py ---
+
+================================================================================
+--- File: cogops/tools/tools.py ---
+================================================================================
+
+# FILE: cogops/tools/tools.py
+
+from typing import List, Dict, Any
+
+# --- Absolute imports for all tool functions ---
+from cogops.tools.custom.knowledge_retriever import retrieve_knowledge
+from cogops.tools.public.product_tools import get_product_details_as_markdown
+from cogops.tools.private.order_tools import get_user_order_profile_as_markdown
+from cogops.tools.public.promotions_tools import get_promotional_products
+
+# --- Available Tools Map ---
+# This dictionary maps the function name (the "key") to the actual Python function object (the "value").
+# The "key" MUST EXACTLY MATCH the 'name' field in the schemas below.
+available_tools_map = {
+    # Public & Custom Tools
+    "retrieve_knowledge": retrieve_knowledge,
+    "get_product_details_as_markdown": get_product_details_as_markdown,
+    
+    # Private, Context-Enrichment Tools (require a valid user session)
+    "get_user_order_profile_as_markdown": get_user_order_profile_as_markdown,
+    # --- NEW: Add the promotional products tool to the map ---
+    "get_promotional_products": get_promotional_products,
+}
+
+
+# --- OpenAI-Compatible Tools List (Schemas) ---
+# This list defines the schema for each tool. The LLM uses this to understand:
+# 1. What the tool does (from the description).
+# 2. What to call it (from the 'name' field, which links to the map above).
+# 3. What arguments it needs (from the parameters).
+tools_list = [
+    # ===================================================================
+    # CUSTOM & KNOWLEDGE TOOLS
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_knowledge",
+            "description": "Call this function to find answers in the official Bengal Meat knowledge base for all informational, non-product, and non-order questions. It retrieves relevant text passages to answer the user's query.\n\n*** USE THIS TOOL FOR QUESTIONS ABOUT ***\n1.  **Policies & Rules:** Return/Refund Policy, Privacy Policy, Terms and Conditions.\n2.  **How-To Guides:** How to place an order, track an order, use coupons, reset passwords.\n3.  **Product & Safety Info:** Food safety, Halal process, product details (e.g., 'what is a steak?'), sourcing.\n4.  **General Company Info:** Delivery times/charges, payment methods, customer care hours, business inquiries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user's full and specific question. Use the text from the user's prompt directly. EXAMPLES: 'ফেরত দেওয়ার নিয়ম কী?' (What is the return policy?), 'আমার অর্ডার ট্র্যাক করব কীভাবে?' (How do I track my order?)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+
+    # ===================================================================
+    # PUBLIC PRODUCT TOOLS (Session-Aware)
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            # --- FIX 1: The 'name' now EXACTLY matches the key in available_tools_map ---
+            "name": "get_product_details_as_markdown",
+            "description": "Call this function to get ALL details for a SINGLE, SPECIFIC product. Use this when a user asks for more information about a product they are interested in.\n\n*** WHEN TO USE ***\n- The user asks for the price of a specific item, e.g., 'What is the price of Beef Bone In?'\n- The user asks if a specific item is in stock, e.g., 'Is Chinigura Rice available?'\n- The user asks for a description of a specific item, e.g., 'Tell me more about the Chicken Nuggets.'\n\n*** CRITICAL INSTRUCTION FOR FINDING THE 'slug' ***\nBefore calling this tool, you MUST find the product's unique `slug` from the `STORE_CATALOG` that is provided in your system prompt. Match the user's requested product name to the name in the catalog to find its corresponding slug. **Do not guess the slug.**\n\n*** WHAT IT RETURNS ***\n- A **Markdown formatted string** with a complete summary of the product, including price, stock status, description, and related product suggestions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "The unique URL-friendly identifier for the product, found in the STORE_CATALOG. Example: 'beef-back-leg-bone-in', 'paratha-20-pcs'."
+                    },
+                    "store_id": {
+                        "type": "integer",
+                        "description": "The unique numerical ID of the store where the user is shopping. This is mandatory."
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "The customer's unique ID. This is REQUIRED. If the user is not logged in, you MUST use the default guest ID, which is '369'."
+                    }
+                },
+                "required": ["slug", "store_id", "customer_id"]
+            }
+        }
+    },
+    # ===================================================================
+    # PRODUCT DISCOVERY & PROMOTIONAL TOOLS
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            "name": "get_promotional_products",
+            "description": "Use this tool to answer user questions about product recommendations, deals, popular items, or best-selling products. It can fetch multiple categories at once. This is the main tool for product discovery questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["best_sellers", "best_deals", "popular_items"]
+                        },
+                        "description": "A list of categories to fetch. Use the category that best matches the user's query. For example, if the user asks 'What's on sale?', use ['best_deals']. If they ask 'What do you recommend?', a good default is ['best_sellers', 'popular_items']."
+                    }
+                },
+                "required": ["categories"]
+            }
+        }
+    },
+    
+    # ===================================================================
+    # PRIVATE, ORDER-RELATED TOOLS (FOR LOGGED-IN USERS)
+    # ===================================================================
+    {
+        "type": "function",
+        "function": {
+            # --- FIX 2: The 'name' now EXACTLY matches the key in available_tools_map ---
+            "name": "get_user_order_profile_as_markdown",
+            "description": "The main tool for answering ANY question about a logged-in user's past or current orders.\n\n*** WHEN TO USE ***\n\n1.  **For a Specific Order:** If the user provides an order number/code (e.g., 'What's the status of order 250814...?'), call this function and pass the code to the `order_code` parameter.\n\n2.  **For General History:** If the user asks a general question (e.g., 'Show my recent orders', 'What did I buy last time?'), call this function WITHOUT the `order_code` parameter.\n\n*** WHAT IT RETURNS ***\n- A **Markdown formatted string** summarizing the user's recent orders or detailing a specific one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_code": {
+                        "type": "string",
+                        "description": "Optional. The unique code of a specific order (e.g., '25081411552764833049'). Provide this ONLY when the user asks about one single order. For general history questions, OMIT this parameter."
+                    }
+                }
+            }
+        }
+    }
+]
+
+================================================================================
+--- File: cogops/tools/custom/knowledge_retriever.py ---
+================================================================================
+
+# tools.py
+# This script defines various tool functions that can be used by the LLM service.
+# Currently includes: get_current_time and retrieve_knowledge.
+# The VectorRetriever class is assumed to be in cogops.retriver.vector_search.
+# Also includes the OpenAI-compatible tools_list and available_tools_map for easy import.
+
+import os
+import json
+import asyncio
+import logging
+from datetime import datetime
+from collections import defaultdict
+import yaml
+import chromadb
+from typing import List, Dict, Any, Tuple
+from dotenv import load_dotenv
+load_dotenv()
+# --- Custom Module Imports ---
+# Adjust these paths based on your actual project structure
+from cogops.retriver.vector_search import VectorRetriever  # Assuming this is where VectorRetriever is defined
+
+CONFIG_CONSTANT=os.getenv("CONFIG_FILE_PATH")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_current_time() -> str:
+    """Returns the current server date and time as a formatted string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+async def retrieve_knowledge(query: str) -> List[Dict[str, Any]]:
+    """Async tool function to retrieve passages from the knowledge base using VectorRetriever."""
+    retriever = VectorRetriever(config_path=CONFIG_CONSTANT)
+    try:
+        passages = await retriever.retrieve_passages(query)
+        return passages
+    except Exception as e:
+        logging.error(f"Error in retrieve_knowledge: {e}", exc_info=True)
+        return []
+    finally:
+        retriever.close()
+
+
+
+================================================================================
+--- File: cogops/tools/private/user_tools.py ---
+================================================================================
+
+# FILE: tools/private/user_tools.py
+
+import os
+import requests
+import logging
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+
+# --- CRITICAL: Import the function you want to reuse ---
+from cogops.tools.private.order_tools import get_user_order_profile_as_markdown
+from cogops.utils.private_api import make_private_request as _make_private_request
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# --- Original User Profile Function (from your file) ---
+def fetch_user_profile(session_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fetches the profile details of the logged-in user."""
+    user_id = session_meta.get('user_id')
+    if not user_id:
+        logging.warning("fetch_user_profile: Attempted to call without user_id. Skipping.")
+        return None
+
+    endpoint = f"customer/{user_id}"
+    logging.info(f"Fetching user profile for user_id: {user_id}")
+    data = _make_private_request(endpoint, session_meta, method='GET') # Explicitly GET
+    
+    if data and data.get('data'):
+        user_info = data['data'][0]
+        return {
+            "name": user_info.get("customer_name"), 
+            "email": user_info.get("email"),
+            "phone": user_info.get("phone"), 
+            "gender": user_info.get("gender"),
+        }
+        
+    logging.warning(f"Failed to fetch or parse profile for user_id: {user_id}")
+    return None
+
+
+# --- NEW MASTER ORCHESTRATOR FUNCTION ---
+
+def generate_full_user_context_markdown(session_meta: Dict[str, Any]) -> str:
+    """
+    Orchestrates calls to fetch user profile and order history, then combines
+    them into a single, comprehensive Markdown string for LLM context.
+    """
+    if not session_meta.get('user_id'):
+        return "# User Context\n\nError: No active user session provided. The user is not logged in."
+
+    logging.info(f"Generating full user context for user_id: {session_meta['user_id']}")
+    
+    markdown_lines = ["# User Context Summary"]
+
+    # --- 1. Get and format the User Profile section ---
+    markdown_lines.append("\n## User Details")
+    profile_data = fetch_user_profile(session_meta)
+    if profile_data:
+        markdown_lines.append(f"- **Name:** {profile_data.get('name', 'N/A')}")
+        markdown_lines.append(f"- **Email:** {profile_data.get('email', 'N/A')}")
+        markdown_lines.append(f"- **Phone:** {profile_data.get('phone', 'N/A')}")
+    else:
+        markdown_lines.append("- *User details could not be retrieved.*")
+
+    # --- 2. Reuse the order tool to get the complete, pre-formatted order history section ---
+    markdown_lines.append("\n## Recent Order Activity")
+    # This call directly returns a formatted Markdown string
+    order_history_markdown = get_user_order_profile_as_markdown(session_meta)
+    
+    # Clean up the redundant header from the reused function for a cleaner final output
+    # This makes the final document more seamless.
+    if "# User Order Profile" in order_history_markdown:
+        order_history_markdown = order_history_markdown.replace("# User Order Profile", "").strip()
+
+    markdown_lines.append(order_history_markdown)
+
+    return "\n".join(markdown_lines)
+
+
+
+
+================================================================================
+--- File: cogops/tools/private/order_tools.py ---
+================================================================================
+
+# FILE: tools/private/order_tools.py
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from datetime import datetime
+from cogops.utils.private_api import make_private_request as _make_private_request
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper to format dates cleanly ---
+def _format_date(date_string: Optional[str]) -> str:
+    if not date_string:
+        return "N/A"
+    try:
+        return datetime.fromisoformat(date_string.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+    except (ValueError, TypeError):
+        return date_string
+
+# --- NEW MASTER TOOL FUNCTION ---
+
+def get_user_order_profile_as_markdown(session_meta: Dict[str, Any], order_code: Optional[str] = None) -> str:
+    """
+    Fetches a user's order history and/or the details of a specific order,
+    then formats the output into a comprehensive and token-efficient Markdown string.
+
+    - If 'order_code' is provided, it fetches details for that specific order.
+    - If 'order_code' is omitted, it fetches a summary of the user's 3 most recent orders.
+    """
+    user_id = session_meta.get('user_id')
+    if not user_id:
+        return "Error: Cannot fetch order profile without a user session."
+
+    # --- Step 1: Always fetch the recent order history first ---
+    history_endpoint = "order-btoc/orderHistoryOrderData/0"
+    history_response = _make_private_request(history_endpoint, session_meta)
+
+    if not history_response or not history_response.get('data'):
+        return "# User Order Profile\n\nNo order history found for this user."
+
+    order_history = history_response['data']
+
+    # --- Scenario A: User asked for a SPECIFIC order ---
+    if order_code:
+        target_order_summary = next((order for order in order_history if order.get("order_code") == order_code), None)
+        if not target_order_summary:
+            return f"# Order Not Found\n\nCould not find an order with the code `{order_code}` in the user's recent history."
+
+        order_id = target_order_summary.get('id')
+        return _fetch_and_format_single_order(order_id, session_meta)
+
+    # --- Scenario B: User asked for a GENERAL history or for recommendations ---
+    else:
+        markdown_lines = ["# User Order Profile", "A summary of the user's most recent purchasing behavior."]
+        
+        # Limit to the 3 most recent orders to avoid being too slow or verbose
+        for order_summary in order_history[:3]:
+            order_id = order_summary.get('id')
+            if order_id:
+                # Fetch details for each order to get the product list
+                details_md = _fetch_and_format_single_order(order_id, session_meta, summary_mode=True)
+                markdown_lines.append("\n---\n" + details_md)
+        
+        return "\n".join(markdown_lines)
+
+
+def _fetch_and_format_single_order(order_id: int, session_meta: Dict[str, Any], summary_mode: bool = False) -> str:
+    """Internal helper to fetch and format one order's details into Markdown."""
+    endpoint = f"order-btoc/orderProductListFromOrderId/{order_id}"
+    data = _make_private_request(endpoint, session_meta)
+
+    if not data or not data.get('data'):
+        return f"### Order ID: {order_id}\n- Error: Could not retrieve details for this order."
+
+    order_info = data['data'].get('orderInfo', {})
+    products = data['data'].get('baseProductData', [])
+
+    if not order_info:
+        return f"### Order ID: {order_id}\n- Error: Missing order summary information."
+        
+    order_code = order_info.get('order_code', 'N/A')
+    order_date = _format_date(order_info.get('order_at'))
+    status = order_info.get('status', 'N/A')
+
+    # In summary mode, we use a more compact format
+    if summary_mode:
+        lines = [f"### Order `{order_code}` (Placed on: {order_date})"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Total:** {order_info.get('grand_total', 'N/A')} BDT")
+    else: # Full detail mode
+        lines = [f"# Details for Order `{order_code}`"]
+        lines.append(f"- **Status:** {status}")
+        lines.append(f"- **Order Date:** {order_date}")
+        lines.append(f"- **Payment Method:** {order_info.get('online_payment_method', 'N/A')}")
+        lines.append(f"- **Delivery Address:** {order_info.get('delivery_address_text', 'N/A')}")
+        lines.append(f"- **Subtotal:** {order_info.get('total', 'N/A')} BDT")
+        lines.append(f"- **Delivery Fee:** {order_info.get('delivery_charge', 'N/A')} BDT")
+        lines.append(f"- **Grand Total:** {order_info.get('grand_total', 'N/A')} BDT")
+
+    if products:
+        lines.append("- **Items in Order:**")
+        for prod in products:
+            lines.append(f"  - {prod.get('product_name', 'N/A')} (Qty: {prod.get('quantity', 0)})")
+    else:
+        lines.append("- No product information available for this order.")
+        
+    return "\n".join(lines)
+
+================================================================================
+--- File: cogops/tools/public/product_tools.py ---
+================================================================================
+
+# FILE: tools/public/product_tools.py
+
+import os
+import requests
+from bs4 import BeautifulSoup
+import logging
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+
+# Load environment variables from your .env file
+load_dotenv()
+
+# --- Configuration ---
+# This script requires the COMPANY_API_BASE_URL environment variable.
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _fetch_and_build_product_tree(store_id: int, customer_id: str) -> Dict[str, Any]:
+    """
+    Internal function to fetch product data and build a structured Python dictionary.
+    This is the shared logic for both Markdown and YAML formatters.
+    """
+    api_url = f"{BASE_URL}/product/productListForChatbot"
+    payload = {
+        "store_id": str(store_id), "company_id": 1, "order_by": "popularity", "customer_id": str(customer_id)
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=20)
+        response.raise_for_status()
+        product_list = response.json().get('data', {}).get(str(store_id), [])
+        if not product_list:
+            return {}
+
+        product_tree = {}
+        for product in product_list:
+            required_keys = ['parent_category_slug', 'parent_category_name', 'category_slug', 'category_name', 'product_slug', 'name']
+            if not all(product.get(key) for key in required_keys):
+                continue
+            
+            parent_slug = product['parent_category_slug']
+            if parent_slug not in product_tree:
+                product_tree[parent_slug] = {
+                    "name": product['parent_category_name'], "slug": parent_slug, "categories": {}
+                }
+            
+            cat_slug = product['category_slug']
+            if cat_slug not in product_tree[parent_slug]["categories"]:
+                product_tree[parent_slug]["categories"][cat_slug] = {
+                    "name": product['category_name'], "slug": cat_slug, "products": []
+                }
+            
+            product_tree[parent_slug]["categories"][cat_slug]["products"].append({
+                "name": product["name"], "slug": product["product_slug"]
+            })
+        
+        # Convert inner category dicts to lists
+        for parent_data in product_tree.values():
+            parent_data["categories"] = list(parent_data["categories"].values())
+
+        return {"store_name": product_list[0].get('store_name'), "tree": product_tree}
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed for store_id '{store_id}'. Error: {e}")
+        return {}
+    except (ValueError, KeyError) as e:
+        logging.error(f"Failed to parse API response for store_id '{store_id}'. Error: {e}")
+        return {}
+
+def get_product_catalog_as_markdown(store_id: int, customer_id: str) -> str:
+    """
+    Fetches the product catalog and formats it as a highly token-efficient 
+    and human-readable Markdown string. It uses the [Name](slug) syntax.
+
+    Returns:
+        A Markdown formatted string of the product catalog.
+    """
+    data = _fetch_and_build_product_tree(store_id, customer_id)
+    if not data or not data.get("tree"):
+        return "No products are currently available for this store."
+
+    product_tree = data["tree"]
+    store_name = data["store_name"]
+
+    markdown_lines = [f"# Product Catalog for {store_name}\n"]
+    for parent_data in product_tree.values():
+        # Parent Category: Level 2 Heading
+        markdown_lines.append(f"## [{parent_data['name']}]({parent_data['slug']})")
+        for category_data in parent_data['categories']:
+            # Category: Level 3 Heading
+            markdown_lines.append(f"  ### [{category_data['name']}]({category_data['slug']})")
+            for prod in category_data['products']:
+                # Product: List item
+                markdown_lines.append(f"    - [{prod['name']}]({prod['slug']})")
+        markdown_lines.append("") # Spacer
+
+    return "\n".join(markdown_lines)
+
+def get_product_details_as_markdown(slug: str, store_id: int, customer_id: int) -> str:
+    """
+    Retrieves exhaustive details for a single product using its slug and formats
+    the output into a token-efficient, LLM-friendly Markdown string.
+
+    Args:
+        slug: The URL-friendly slug of the product (e.g., 'beef-back-leg-bone-in').
+        store_id: The ID of the store for checking availability and details.
+        customer_id: The customer's ID. This is required (e.g., '369' for a guest).
+
+    Returns:
+        A detailed Markdown string about the product, or an error message string.
+    """
+    api_url = f"{BASE_URL}/product/getListOfProductDetails"
+    
+    logging.info(f"Requesting details for slug '{slug}' at store_id '{store_id}' for customer '{customer_id}'.")
+
+    payload = {
+        "slug": slug,
+        "store_id": str(store_id),
+        "customer_id": str(customer_id) # Ensure customer_id is a string for the JSON payload
+    }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=15)
+        response.raise_for_status()
+        api_data = response.json().get('data', {})
+
+        product_data = api_data.get('productData')
+        if not product_data or not product_data[0]:
+            logging.warning(f"No details found for slug '{slug}' at store_id '{store_id}'.")
+            return f"Sorry, I could not find any details for a product with the identifier '{slug}'."
+
+        main_product = product_data[0]
+        markdown_lines = []
+
+        # --- Main Product Section ---
+        markdown_lines.append(f"# {main_product.get('name', 'Product Details')}")
+
+        # Price & Availability
+        markdown_lines.append("\n**Price & Availability**")
+        price_unit = f"{main_product.get('sale_uom', '')} {main_product.get('sal_uom_name', '')}".strip()
+        markdown_lines.append(f"- **Price:** {main_product.get('mrp', 'N/A')} BDT per {price_unit}")
+        
+        stock_qty = main_product.get('temp_quantity', 0)
+        markdown_lines.append(f"- **Availability:** {'In Stock' if stock_qty > 0 else 'Out of Stock'}")
+        
+        # Discount Information
+        discount_value = main_product.get('discount_value', 0)
+        if discount_value > 0:
+            # Now, determine the type of discount to format the string correctly.
+            if main_product.get('discount_type') == 'Amount':
+                # This handles fixed amount discounts.
+                markdown_lines.append(f"- **Current Offer:** {discount_value} TK off!")
+            else:
+                # This handles 'Percent' and any other potential discount types as a percentage.
+                markdown_lines.append(f"- **Current Offer:** {discount_value}% off!")
+
+        # Product Description
+        markdown_lines.append("\n**Description**")
+        details_html = main_product.get('details', 'No description available.')
+        cleaned_details = BeautifulSoup(details_html, "html.parser").get_text(separator='\n', strip=True)
+        markdown_lines.append(cleaned_details)
+
+        # Promotional Info
+        if main_product.get('meta_description'):
+            markdown_lines.append("\n**Good to Know**")
+            markdown_lines.append(f"> {main_product['meta_description']}")
+
+        # --- Related Products Section (Top 3) ---
+        related_products = api_data.get('relatedProducts', [])[:3]
+        if related_products:
+            markdown_lines.append("\n---\n\n## Frequently Bought Together")
+            for rel_prod in related_products:
+                markdown_lines.append(f"\n### {rel_prod.get('name', 'Related Product')}")
+                rel_price_unit = f"{rel_prod.get('sale_uom', '')} {rel_prod.get('sal_uom_name', '')}".strip()
+                rel_stock = "In Stock" if rel_prod.get('temp_quantity', 0) > 0 else "Out of Stock"
+                markdown_lines.append(f"- **Price:** {rel_prod.get('mrp')} BDT per {rel_price_unit}")
+                markdown_lines.append(f"- **Availability:** {rel_stock}")
+                markdown_lines.append(f"- **Identifier:** `{rel_prod.get('slug')}`")
+
+        return "\n".join(markdown_lines)
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed for product slug '{slug}'. Error: {e}")
+        return "Sorry, I'm having trouble connecting to the product server right now."
+    except (KeyError, IndexError) as e:
+        logging.error(f"Failed to parse the API response for slug '{slug}'. Missing key: {e}")
+        return "Sorry, I received an unexpected response from the server."
+
+================================================================================
+--- File: cogops/tools/public/promotions_tools.py ---
+================================================================================
+
+# --- START OF REWRITTEN FILE: cogops/tools/public/promotions_tools.py ---
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any, Optional, Union
+
+# Use the hardened private_api utility for authenticated calls
+from cogops.utils.private_api import make_private_request
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL")
+if not BASE_URL:
+    raise ValueError("FATAL ERROR: COMPANY_API_BASE_URL environment variable is not set.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def _format_products_to_markdown(data: Dict[str, List[Dict]], categories: List[str], limit: int = 5) -> str:
+    """
+    Internal helper to format the raw API product data into a clean, token-efficient
+    Markdown string for the LLM.
+
+    Args:
+        data (Dict[str, List[Dict]]): The raw data dict from the API ('bestSell', 'bestDeal', etc.).
+        categories (List[str]): The list of categories to include in the output.
+        limit (int): The maximum number of products to list per category.
+
+    Returns:
+        str: A formatted Markdown string.
+    """
+    markdown_lines = []
+    
+    # Map the tool's category names to the API's response keys
+    key_map = {
+        "best_sellers": "bestSell",
+        "best_deals": "bestDeal",
+        "popular_items": "popular"
+    }
+
+    for category in categories:
+        api_key = key_map.get(category)
+        product_list = data.get(api_key)
+
+        if not product_list:
+            continue
+
+        # Use a more user-friendly title in the Markdown output
+        title = category.replace('_', ' ').title()
+        markdown_lines.append(f"## Top {limit} {title}")
+        
+        for product in product_list[:limit]:
+            name = product.get('name', 'N/A')
+            price = product.get('mrp', 'N/A')
+            slug = product.get('slug', '')
+            
+            line = f"- **{name}**: {price} BDT"
+            
+            # Add discount information if it's relevant and valid
+            discount_value = product.get('discount_value', 0)
+            if discount_value > 0 and product.get('discount_validity', 0) == 1:
+                discount_type = product.get('discount_type', 'Percent')
+                if discount_type == 'Amount':
+                    line += f" (Discount: {discount_value} TK off!)"
+                else:
+                    line += f" (Discount: {discount_value}%)"
+            
+            # Add the slug for the LLM to use with other tools
+            line += f" `slug: {slug}`"
+            markdown_lines.append(line)
+        
+        markdown_lines.append("") # Add a spacer between categories
+
+    if not markdown_lines:
+        return "No items were found in the requested categories for this store."
+        
+    return "\n".join(markdown_lines)
+
+
+def get_promotional_products(
+    session_meta: Dict[str, Any],
+    categories: Union[str, List[str]] = ["best_sellers", "best_deals", "popular_items"]
+) -> str:
+    """
+    Fetches and summarizes products from 'Best Sellers', 'Best Deals', or 'Popular' categories.
+
+    This tool intelligently detects if a user is logged in to provide potentially
+    personalized results. The output is a formatted Markdown string suitable for an LLM.
+
+    Args:
+        session_meta (Dict[str, Any]): The user's session data from the API service.
+        categories (Union[str, List[str]]): A list of categories to fetch.
+            Valid options are: "best_sellers", "best_deals", "popular_items".
+            Defaults to all three.
+
+    Returns:
+        str: A Markdown formatted string summarizing the requested product categories.
+    """
+    store_id = session_meta.get('store_id')
+    if not store_id:
+        return "Error: store_id is missing from the session."
+
+    # Standardize categories to a list
+    if isinstance(categories, str):
+        categories = [categories]
+
+    # Determine if this is a private (logged-in) or public (guest) call
+    customer_id = session_meta.get('user_id')
+    access_token = session_meta.get('access_token')
+    is_private_call = all([customer_id, access_token])
+
+    api_data = None
+    try:
+        if is_private_call:
+            # Use the personalized endpoint for logged-in users
+            endpoint = f"product/bestSellBestDealPopular/{store_id}/{customer_id}"
+            logging.info(f"Making a PRIVATE request to promotional endpoint: {endpoint}")
+            response_json = make_private_request(endpoint, session_meta)
+        else:
+            # Use the public endpoint for guests
+            endpoint = f"product/bestSellBestDealPopular/{store_id}"
+            api_url = f"{BASE_URL}/{endpoint}"
+            logging.info(f"Making a PUBLIC request to promotional endpoint: {api_url}")
+            response = requests.get(api_url, timeout=15)
+            response.raise_for_status()
+            response_json = response.json()
+        
+        api_data = response_json.get('data') if response_json else None
+
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"HTTP error fetching promotional products for store {store_id}: {e}")
+        return f"Error: The server returned an error: {e.response.status_code}"
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error fetching promotional products for store {store_id}: {e}")
+        return "Error: Could not connect to the product server."
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in get_promotional_products: {e}", exc_info=True)
+        return "Error: An unexpected error occurred while fetching product data."
+
+    if not api_data:
+        logging.warning(f"No promotional data returned from API for store {store_id}.")
+        return "No best sellers, deals, or popular items could be found at this time."
+
+    # Format the successfully fetched data into Markdown for the LLM
+    return _format_products_to_markdown(api_data, categories)
+
+# --- END OF REWRITTEN FILE: cogops/tools/public/promotions_tools.py ---
+
+================================================================================
+--- File: cogops/tools/public/location_tools.py ---
+================================================================================
+
+# FILE: tools/public/location_tools.py (or a new utility file)
+
+import os
+import requests
+import logging
+from typing import List, Dict, Any
+from collections import defaultdict
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# --- Configuration ---
+BASE_URL = os.getenv("COMPANY_API_BASE_URL", "https://api.bengalmeat.com") # Provide a default
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Existing API Call Functions (keep them as they are) ---
+
+def get_all_store_locations() -> List[Dict[str, Any]]:
+    """Fetches a list of all physical Bengal Meat stores."""
+    api_url = f"{BASE_URL}/store/storelistopen/1?is_visible=1"
+    try:
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('data', [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch store locations: {e}")
+        return []
+
+def get_operational_cities() -> List[str]:
+    """Returns a list of all cities where Bengal Meat operates."""
+    api_url = f"{BASE_URL}/customer/city"
+    try:
+        response = requests.post(api_url, timeout=10)
+        response.raise_for_status()
+        cities_data = response.json().get('data', {}).get('data', [])
+        return [city['name'] for city in cities_data if 'name' in city]
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch operational cities: {e}")
+        return []
+
+def get_all_delivery_areas() -> List[Dict[str, Any]]:
+    """Fetches a list of all specific delivery areas."""
+    api_url = f"{BASE_URL}/polygon/areaByCity/"
+    try:
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()
+        return response.json().get('data', [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch delivery areas: {e}")
+        return []
+
+# --- NEW MASTER FUNCTION ---
+
+def generate_location_and_delivery_markdown() -> str:
+    """
+    Fetches data from all location-related APIs and combines it into a single,
+    comprehensive, and LLM-friendly Markdown document.
+
+    This is designed to be run periodically to generate a static context file.
+    """
+    logging.info("Starting generation of the master location Markdown document...")
+
+    # 1. Fetch all necessary data from the APIs
+    stores = get_all_store_locations()
+    areas = get_all_delivery_areas()
+
+    if not stores:
+        return "# Location Information\n\nSorry, could not retrieve store location information at this time."
+
+    # 2. Process and structure the data
+    # Group stores by city
+    stores_by_city = defaultdict(list)
+    for store in stores:
+        # Filter out test stores or stores without a city
+        if "test" in store.get("name", "").lower() or not store.get("CITY"):
+            continue
+        stores_by_city[store["CITY"]].append(store)
+
+    # Map delivery areas to their respective stores for easy lookup
+    areas_by_store_id = defaultdict(list)
+    for area in areas:
+        if area.get("storeId") and area.get("name"):
+            areas_by_store_id[area["storeId"]].append(area["name"])
+
+    # 3. Build the Markdown String
+    markdown_lines = ["# Bengal Meat Store Locations & Delivery Areas"]
+    markdown_lines.append("This document contains all operational cities, physical store details, and specific delivery areas.")
+
+    # Sort cities for consistent output
+    sorted_cities = sorted(stores_by_city.keys())
+
+    for city in sorted_cities:
+        markdown_lines.append(f"\n## City: {city}")
+        
+        # Sort stores within the city by name
+        sorted_stores = sorted(stores_by_city[city], key=lambda s: s['name'])
+        
+        for store in sorted_stores:
+            store_id = store['id']
+            markdown_lines.append(f"\n### {store.get('name', 'N/A')}")
+            markdown_lines.append(f"- **Store ID:** {store_id}")
+            markdown_lines.append(f"- **Address:** {store.get('address', 'N/A').strip()}")
+            markdown_lines.append(f"- **Phone:** {store.get('contact_person_phone', 'N/A')}")
+            
+            # Add the list of delivery areas for this store
+            delivery_areas = sorted(areas_by_store_id.get(store_id, []))
+            if delivery_areas:
+                markdown_lines.append("- **Delivery Areas Covered:**")
+                for area in delivery_areas:
+                    markdown_lines.append(f"  - {area}")
+
+    logging.info("Successfully generated the master location Markdown document.")
+    return "\n".join(markdown_lines)
+
+================================================================================
+--- File: ingestion/ingest_data.py ---
+================================================================================
+
+# --- START OF MODIFIED FILE: ingestion/ingest_data.py ---
+
+import os
+import yaml
+import argparse
+import json
+from datetime import datetime
+from loguru import logger
+import sys
+from dotenv import load_dotenv
+from tqdm import tqdm
+import chromadb
+
+# --- Custom Module Imports ---
+from cogops.retriver.db import SQLDatabaseManager
+from cogops.utils.db_config import get_postgres_config
+from cogops.models.embGemma_embedder import GemmaTritonEmbedder, GemmaTritonEmbedderConfig
+
+load_dotenv()
+
+# --- Infrastructure Configuration ---
+TRITON_URL = os.environ.get("TRITON_EMBEDDER_URL")
+CHROMA_HOST = os.environ.get("CHROMA_DB_HOST")
+CHROMA_PORT = int(os.environ.get("CHROMA_DB_PORT", 8000))
+POSTGRES_CONFIG = get_postgres_config()
+
+def load_agent_config(config_path: str) -> dict:
+    """Loads the agent's YAML configuration file."""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logger.critical(f"FATAL: Configuration file not found at: {config_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"FATAL: Error loading YAML configuration: {e}")
+        sys.exit(1)
+
+def load_json_files(json_folder_path: str) -> list:
+    """Loads all JSON files from a directory, skipping corrupted ones."""
+    if not os.path.isdir(json_folder_path):
+        logger.critical(f"FATAL: JSON folder not found at: {json_folder_path}")
+        sys.exit(1)
+        
+    all_json_data = []
+    file_list = [f for f in os.listdir(json_folder_path) if f.endswith('.json')]
+    
+    logger.info(f"Loading JSON files from '{json_folder_path}'...")
+    for filename in tqdm(file_list, desc="Reading JSON files"):
+        filepath = os.path.join(json_folder_path, filename)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Basic validation to ensure the core key is present
+                if 'passage_id' in data:
+                    all_json_data.append(data)
+                else:
+                    logger.warning(f"Skipping {filename}: missing 'passage_id' key.")
+        except json.JSONDecodeError:
+            logger.error(f"SKIPPING: Could not parse JSON from {filename}. File is corrupt.")
+        except Exception as e:
+            logger.error(f"SKIPPING: Failed to read {filename} due to an unexpected error: {e}")
+            
+    logger.info(f"Successfully loaded and validated {len(all_json_data)} JSON files.")
+    return all_json_data
+
+def ingest_to_postgres(db_manager: SQLDatabaseManager, all_json_data: list):
+    """Prepares and upserts structured data into PostgreSQL."""
+    logger.info("--- Starting PostgreSQL Ingestion ---")
+    
+    postgres_records = []
+    postgres_columns = ['passage_id', 'topic', 'text', 'date']
+
+    for data in all_json_data:
+        try:
+            record = {key: data.get(key) for key in postgres_columns}
+            if isinstance(record.get('date'), str):
+                record['date'] = datetime.fromisoformat(record['date']).date()
+            postgres_records.append(record)
+        except (ValueError, TypeError) as e:
+            logger.error(f"SKIPPING record for passage_id {data.get('passage_id')}: Invalid data format. Error: {e}")
+            continue
+
+    if not postgres_records:
+        logger.warning("No valid records to insert into PostgreSQL. Skipping.")
+        return
+
+    update_columns = [col for col in postgres_columns if col != 'passage_id']
+    
+    try:
+        logger.info(f"Upserting {len(postgres_records)} records into the 'passages' table...")
+        db_manager.upsert_passages(insert_data=postgres_records, update_columns=update_columns)
+        logger.success("✅ PostgreSQL ingestion complete.")
+    except Exception as e:
+        logger.critical(f"CRITICAL: A database error occurred during PostgreSQL upsert: {e}", exc_info=True)
+        # In a real pipeline, this might trigger an alert. We exit to prevent partial states.
+        sys.exit(1)
+
+def ingest_to_chroma(chroma_client: chromadb.Client, embedder: GemmaTritonEmbedder, config: dict, all_json_data: list):
+    """Prepares, embeds, and ingests data into multiple ChromaDB collections with robust error handling."""
+    logger.info("--- Starting ChromaDB Ingestion ---")
+
+    collection_key_map = {
+        "PropositionsDB": "propositions", "SummariesDB": "summaries", "QuestionsDB": "question_patterns"
+    }
+    collections_to_process = config['vector_retriever']['collections']
+    passage_id_meta_key = config['vector_retriever']['passage_id_meta_key']
+    passage_embedding_function = embedder.as_chroma_passage_embedder()
+
+    for collection_name in collections_to_process:
+        json_key = collection_key_map.get(collection_name)
+        if not json_key:
+            logger.warning(f"No mapping found for collection '{collection_name}'. Skipping.")
+            continue
+
+        logger.info(f"\nProcessing collection: '{collection_name}'")
+        try:
+            chroma_client.delete_collection(name=collection_name)
+            logger.info(f"Successfully deleted existing collection '{collection_name}'.")
+        except Exception:
+            logger.info(f"Collection '{collection_name}' does not exist. Creating a new one.")
+
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name, embedding_function=passage_embedding_function
+        )
+        
+        documents, metadatas, ids = [], [], []
+        for data in all_json_data:
+            passage_id = data['passage_id']
+            doc_list = data.get(json_key, [])
+            if not isinstance(doc_list, list):
+                logger.warning(f"SKIPPING passage_id {passage_id} for collection '{collection_name}': '{json_key}' is not a list.")
+                continue
+            for i, doc_text in enumerate(doc_list):
+                documents.append(str(doc_text))
+                metadatas.append({passage_id_meta_key: passage_id})
+                ids.append(f"{collection_name}_{passage_id}_{i}")
+
+        if not documents:
+            logger.warning(f"No valid documents found for collection '{collection_name}'. Skipping ingestion.")
+            continue
+
+        batch_size = 32  # Increased batch size for efficiency
+        for i in tqdm(range(0, len(documents), batch_size), desc=f"Ingesting to {collection_name}"):
+            try:
+                collection.add(
+                    documents=documents[i:i + batch_size],
+                    metadatas=metadatas[i:i + batch_size],
+                    ids=ids[i:i + batch_size]
+                )
+            except Exception as e:
+                # Log the batch error but continue to the next batch.
+                logger.error(f"Failed to ingest batch {i//batch_size} for '{collection_name}': {e}", exc_info=True)
+        
+        logger.success(f"✅ Finished ingestion for '{collection_name}'. Final count: {collection.count()} documents.")
+
+def main():
+    """Main function to orchestrate the entire ingestion pipeline."""
+    parser = argparse.ArgumentParser(description="Ingest processed data into PostgreSQL and ChromaDB.")
+    parser.add_argument("--config", type=str, required=True, help="Path to the agent's config.yaml file.")
+    parser.add_argument("--json_folder", type=str, required=True, help="Path to the folder with processed JSON files.")
+    args = parser.parse_args()
+
+    embedder = None
+    try:
+        config = load_agent_config(args.config)
+        all_json_data = load_json_files(args.json_folder)
+        if not all_json_data:
+            logger.error("No valid JSON data loaded. Exiting.")
+            sys.exit(1)
+
+        db_manager = SQLDatabaseManager(POSTGRES_CONFIG)
+        embedder_config = GemmaTritonEmbedderConfig(triton_url=TRITON_URL)
+        embedder = GemmaTritonEmbedder(config=embedder_config)
+        chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        chroma_client.heartbeat() # Verify connection early
+
+        ingest_to_postgres(db_manager, all_json_data)
+        ingest_to_chroma(chroma_client, embedder, config, all_json_data)
+
+    except Exception as e:
+        logger.critical(f"A critical, unhandled error occurred during the ingestion process: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        if embedder:
+            embedder.close()
+        logger.info("\n--- Data Ingestion Script Finished ---")
+
+if __name__ == "__main__":
+    main()
+
+# --- END OF MODIFIED FILE: ingestion/ingest_data.py ---
+
+================================================================================
+--- File: ingestion/requirement.txt ---
+================================================================================
+
+google-genai==1.35.0
+
